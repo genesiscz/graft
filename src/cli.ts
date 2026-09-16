@@ -518,7 +518,7 @@ program
       onlyDirs,
       onProgress: ({ phase, index, total, file }) =>
         process.stderr.write(
-          `\r${phase === "enrich" ? "summarizing" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
+          `\r${phase === "enrich" ? "summarizing" : phase === "read" ? "reading" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
         ),
     }).catch((err: unknown) => {
       track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
