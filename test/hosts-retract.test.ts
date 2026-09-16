@@ -25,6 +25,12 @@ function write(dir: string, rel: string, body: string): string {
   return path;
 }
 
+// Every retract call below passes `home: fresh()`, even the ones that also pass
+// `global: false`. Without a `home`, `homedir()` is the real home of whoever runs the
+// suite, and a call that ever loses its `global: false` retracts their user-level
+// wiring: on 2026-09-16 a run of this suite deleted a developer's real
+// ~/.claude/helpers/graft-hooks.cjs and their `mcpServers.graft`.
+
 /** A retraction report keyed by path, for asserting one target at a time. */
 function byPath(rs: ReturnType<typeof runRetract>): Map<string, string> {
   return new Map(rs.map((r) => [r.path, r.action]));
@@ -39,7 +45,7 @@ const BLOCK = '<!-- graft:start -->\n## Graft — old text\nstale guidance\n<!--
 test('an owned instruction file is deleted outright', () => {
   const d = fresh();
   const rule = write(d, join('.cursor', 'rules', 'graft.mdc'), 'stale cursor rule\n');
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(rule), 'deleted');
   assert.ok(!existsSync(rule));
 });
@@ -47,14 +53,14 @@ test('an owned instruction file is deleted outright', () => {
 test('a fenced section is stripped and the user\'s prose survives intact', () => {
   const d = fresh();
   const agents = write(d, 'AGENTS.md', `# My repo\n\nUser notes here.\n\n${BLOCK}\n\nMore user notes.\n`);
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   assert.equal(readFileSync(agents, 'utf8'), '# My repo\n\nUser notes here.\n\nMore user notes.\n');
 });
 
 test('a file that held nothing but the graft block is deleted, not left blank', () => {
   const d = fresh();
   const gemini = write(d, 'GEMINI.md', `${BLOCK}\n`);
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(gemini), 'deleted');
   assert.ok(!existsSync(gemini), 'an empty GEMINI.md is residue too');
 });
@@ -62,7 +68,7 @@ test('a file that held nothing but the graft block is deleted, not left blank', 
 test('a shared file with no graft block is reported absent and never touched', () => {
   const d = fresh();
   const agents = write(d, 'AGENTS.md', '# Just my notes\n');
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(agents), 'absent');
   assert.equal(readFileSync(agents, 'utf8'), '# Just my notes\n');
 });
@@ -76,7 +82,7 @@ test('mcpServers.graft is removed and foreign servers are preserved', () => {
   const mcp = write(d, '.mcp.json', JSON.stringify({
     mcpServers: { graft: { command: 'graft', args: ['mcp'] }, other: { command: 'x' } },
   }));
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   const root = JSON.parse(readFileSync(mcp, 'utf8'));
   assert.deepEqual(Object.keys(root.mcpServers), ['other']);
 });
@@ -84,7 +90,7 @@ test('mcpServers.graft is removed and foreign servers are preserved', () => {
 test('a JSON config holding only the graft server is deleted', () => {
   const d = fresh();
   const kiro = write(d, join('.kiro', 'settings', 'mcp.json'), JSON.stringify({ mcpServers: { graft: {} } }));
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(kiro), 'deleted');
   assert.ok(!existsSync(kiro), 'no orphan {} left behind');
 });
@@ -93,7 +99,7 @@ test('unparseable JSON is reported and left byte-for-byte alone', () => {
   const d = fresh();
   const body = '{ "mcpServers": { "graft": }  // trailing junk\n';
   const mcp = write(d, '.mcp.json', body);
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(mcp), 'skipped-unparseable');
   assert.equal(readFileSync(mcp, 'utf8'), body);
 });
@@ -106,7 +112,7 @@ test('[mcp_servers.graft] is removed and the neighbouring table survives', () =>
   const d = fresh();
   const toml = write(d, join('.grok', 'config.toml'),
     '[mcp_servers.graft]\ncommand = "npx"\nargs = ["-y","@nanonets/graft","mcp"]\n\n[mcp_servers.keepme]\ncommand = "y"\n');
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   const text = readFileSync(toml, 'utf8');
   assert.ok(!text.includes('mcp_servers.graft'));
   assert.ok(text.includes('[mcp_servers.keepme]'));
@@ -132,7 +138,7 @@ test('graft settings fragments are removed and the user\'s own settings kept', (
     permissions: { allow: ['Bash(graft:*)', 'Bash(ls:*)'] },
     model: 'opus',
   }));
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   const root = JSON.parse(readFileSync(settings, 'utf8'));
 
   assert.equal(root.statusLine, undefined, 'graft statusline gone');
@@ -150,7 +156,7 @@ test('an older statusline shape is still recognized as graft\'s own', () => {
   const settings = write(d, join('.claude', 'settings.json'), JSON.stringify({
     statusLine: { type: 'command', command: 'sh -c \'node .claude/helpers/graft-statusline.cjs\'' },
   }));
-  const r = byPath(runRetract(d, { apply: true, global: false }));
+  const r = byPath(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.equal(r.get(settings), 'deleted', 'matched by shim path, not string equality');
 });
 
@@ -159,7 +165,7 @@ test('a statusline the user actually wrote is left alone', () => {
   const settings = write(d, join('.claude', 'settings.json'), JSON.stringify({
     statusLine: { type: 'command', command: 'my-prompt.sh' },
   }));
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   const root = JSON.parse(readFileSync(settings, 'utf8'));
   assert.equal(root.statusLine.command, 'my-prompt.sh');
 });
@@ -173,7 +179,7 @@ test('graft/ and its ignore entries go, and the user\'s ignores stay', () => {
   mkdirSync(join(d, 'graft'), { recursive: true });
   writeFileSync(join(d, 'graft', 'INDEX.md'), '# index\n');
   const gitignore = write(d, '.gitignore', 'node_modules/\ndist/\n\n# graft\'s local graph cache — regenerable, not committed (run `graft build`).\n/graft/\n');
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   assert.ok(!existsSync(join(d, 'graft')));
   assert.equal(readFileSync(gitignore, 'utf8'), 'node_modules/\ndist/\n');
 });
@@ -182,7 +188,7 @@ test('--keep-cache leaves graft/ and .gitignore untouched', () => {
   const d = fresh();
   mkdirSync(join(d, 'graft'), { recursive: true });
   const gitignore = write(d, '.gitignore', '/graft/\n');
-  runRetract(d, { apply: true, global: false, cache: false });
+  runRetract(d, { apply: true, global: false, home: fresh(), cache: false });
   assert.ok(existsSync(join(d, 'graft')), 'cache kept');
   assert.equal(readFileSync(gitignore, 'utf8'), '/graft/\n');
 });
@@ -195,7 +201,7 @@ test('planRetract is pure — it reports without touching anything', () => {
   const d = fresh();
   const rule = write(d, join('.cursor', 'rules', 'graft.mdc'), 'stale\n');
   const agents = write(d, 'AGENTS.md', `notes\n\n${BLOCK}\n`);
-  const plan = planRetract(d, { global: false });
+  const plan = planRetract(d, { global: false, home: fresh() });
 
   assert.ok(existsSync(rule), 'plan did not delete');
   assert.equal(readFileSync(agents, 'utf8'), `notes\n\n${BLOCK}\n`);
@@ -209,7 +215,7 @@ test('a full init is fully retractable, and retraction is idempotent', () => {
   runInit(d, { build: false, home: fresh() });
   runHostsInit(d, { agents: ['cursor', 'agents'], home: d, global: false });
 
-  const first = changed(runRetract(d, { apply: true, global: false }));
+  const first = changed(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.ok(first.length > 0, 'init left something to retract');
 
   // Everything init wrote for those hosts is gone.
@@ -225,7 +231,7 @@ test('a full init is fully retractable, and retraction is idempotent', () => {
   }
 
   // A second sweep finds nothing — no residue, no double-removal.
-  const second = changed(runRetract(d, { apply: true, global: false }));
+  const second = changed(runRetract(d, { apply: true, global: false, home: fresh() }));
   assert.deepEqual(second, [], `second sweep should be a no-op, got ${JSON.stringify(second)}`);
 });
 
@@ -233,7 +239,7 @@ test('exclude spares the hosts init is about to rewrite', () => {
   const d = fresh();
   const cursor = write(d, join('.cursor', 'rules', 'graft.mdc'), 'cursor\n');
   const kiro = write(d, join('.kiro', 'steering', 'graft.md'), 'kiro\n');
-  runRetract(d, { apply: true, global: false, exclude: ['cursor'] });
+  runRetract(d, { apply: true, global: false, home: fresh(), exclude: ['cursor'] });
   assert.ok(existsSync(cursor), 'selected host kept');
   assert.ok(!existsSync(kiro), 'unselected host retracted');
 });
@@ -269,7 +275,7 @@ test('global sweep strips graft hook entries from Codex hooks.json, keeping fore
 test('emptied directories are pruned, not left hollow', () => {
   const d = fresh();
   write(d, join('.claude', 'skills', 'graft', 'SKILL.md'), 'skill\n');
-  runRetract(d, { apply: true, global: false });
+  runRetract(d, { apply: true, global: false, home: fresh() });
   assert.ok(!existsSync(join(d, '.claude', 'skills', 'graft')), 'graft/ skill dir pruned');
   assert.ok(!existsSync(join(d, '.claude', 'skills')), 'now-empty skills/ pruned too');
 });
@@ -324,7 +330,7 @@ test('a shared AGENTS.md is spared when any host that writes it is kept', () => 
   const d = fresh();
   // Three registry hosts name AGENTS.md: agents, hermes, antigravity.
   const agents = write(d, 'AGENTS.md', `# Notes\n\n${BLOCK}\n`);
-  runRetract(d, { apply: true, global: false, exclude: ['agents'] });
+  runRetract(d, { apply: true, global: false, home: fresh(), exclude: ['agents'] });
   assert.ok(readFileSync(agents, 'utf8').includes('graft:start'),
     'hermes/antigravity must not strip the block that the kept `agents` host owns');
 });

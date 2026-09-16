@@ -183,6 +183,15 @@ export function releaseLock(d: string): void {
  * `<root>/graft/.cache` these are the same file, which is the point: the Claude Code
  * hooks lock by project dir and the graph's auto-refresh locks by the context dir it
  * is actually writing, and the two must collide so they can't rebuild at once.
+ *
+ * A lock names the pid that took it, and a lock whose owner is gone is free at once.
+ * Every holder can die without unwinding — SIGKILL from a host enforcing a hook
+ * budget, a session closing over a detached sync, a build OOM — and no `finally`
+ * runs for any of those. Waiting `LOCK_STALE_MS` (the only rule until now) meant five
+ * minutes in which every query answered from a stale graph and the background sync
+ * was refused, on the strength of a file nobody was holding. The mtime rule stays as
+ * the fallback for a lock this process cannot judge: an unreadable payload, or a pid
+ * that was reused.
  */
 export function acquireLockIn(cache: string): boolean {
   const p = join(cache, LOCK_FILE);
@@ -193,12 +202,40 @@ export function acquireLockIn(cache: string): boolean {
     return true;
   } catch (e: any) {
     if (e?.code !== 'EEXIST') throw e;
-    let stale: boolean;
-    try { stale = Date.now() - statSync(p).mtimeMs >= LOCK_STALE_MS; } catch { stale = true; }
-    if (!stale) return false;
+    if (!lockIsStale(p)) return false;
     try { rmSync(p); } catch { /* another process reclaimed it */ }
     try { writeFileSync(p, payload, { flag: 'wx' }); return true; }
     catch (e2: any) { if (e2?.code === 'EEXIST') return false; throw e2; }
+  }
+}
+
+/** Dead owner, or older than `LOCK_STALE_MS`, or gone from under us. */
+function lockIsStale(p: string): boolean {
+  const owner = lockOwner(p);
+  if (owner !== null && !processAlive(owner)) return true;
+  try { return Date.now() - statSync(p).mtimeMs >= LOCK_STALE_MS; } catch { return true; }
+}
+
+function lockOwner(p: string): number | null {
+  try {
+    const pid = JSON.parse(readFileSync(p, 'utf8'))?.pid;
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `kill(pid, 0)` delivers nothing; it only asks whether the pid exists. EPERM means
+ * it does, under another user, which counts as alive here. ESRCH is the one answer
+ * that says it is gone; anything else is not evidence and reads as alive.
+ */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code !== 'ESRCH';
   }
 }
 export function releaseLockIn(cache: string): void {

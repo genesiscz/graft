@@ -33,8 +33,14 @@ function hookCmd(arg: string, helpers: string = REPO_HELPERS): string {
 }
 function graftBlocks(helpers?: string): Record<string, Json[]> {
   return {
+    // `timeout` is in SECONDS: that is the unit Claude Code reads (its own default is
+    // 600). These were written as milliseconds until 0.18.0, which made a 15s budget
+    // four hours, so a stalled hook blocked the turn instead of being cut off (#283).
+    // `hooks.ts` reads the installed number back to size its `graft ask` child and
+    // treats a legacy value ≥ 1000 as milliseconds, so a repo wired by an older init
+    // keeps a child that fits inside the budget it really has.
     PostToolUse: [
-      { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10000 }] },
+      { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10 }] },
       // Score the usage mix and sum token savings. A graft retrieval (CLI `graft …`
       // via Bash, or the `graft_*` MCP tools) prints a `[graft] tokens saved ≈ N`
       // footer this hook sums into the session total; the same hook classifies
@@ -42,19 +48,17 @@ function graftBlocks(helpers?: string): Record<string, Json[]> {
       // `graft stats` and the `session_summary` graft-vs-grep ratio. Broad matcher,
       // but the handler no-ops instantly unless there is something to record, so an
       // unrelated Bash or a plain Read costs only a stdin read.
-      { matcher: 'Bash|mcp__graft__|Read|Grep|Glob', hooks: [{ type: 'command', command: hookCmd('tool-savings', helpers), timeout: 8000 }] },
+      { matcher: 'Bash|mcp__graft__|Read|Grep|Glob', hooks: [{ type: 'command', command: hookCmd('tool-savings', helpers), timeout: 8 }] },
     ],
-    // Longer budget than the other hooks: its `graft ask` is a real query, and a
-    // query now brings the graph up to date first (graph/refresh.ts) — usually
-    // milliseconds, but the first one after an upgrade re-parses the repo once.
-    // `hooks.ts` reads this number back out of the installed settings.json at
-    // runtime and caps its `graft ask` child just under it, so a repo wired before
-    // this bump (8s) keeps a child that fits inside 8s. Changing the number here is
-    // therefore safe on its own — but it only reaches an existing repo when someone
-    // re-runs `graft init`, since that is the only caller of this function.
-    UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15000 }] }],
-    SessionStart: [{ hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8000 }] }],
-    Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop', helpers), timeout: 8000 }] }],
+    // Longer budget than the other hooks: its `graft ask` is a real query, and on a
+    // big graph reading the answer takes a few seconds. Read time only — the hook
+    // asks `--no-refresh`, and every rebuild belongs to the detached end-of-turn
+    // sync (`sync-run.ts`), which has no seconds budget to fit inside. Changing the
+    // number here is safe on its own, but it only reaches an existing repo when
+    // someone re-runs `graft init`, since that is the only caller of this function.
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15 }] }],
+    SessionStart: [{ hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8 }] }],
+    Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop', helpers), timeout: 8 }] }],
   };
 }
 /**

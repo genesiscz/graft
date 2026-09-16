@@ -8,7 +8,8 @@ import { readStats, readSession } from '../src/claude/state.js';
 import { runSync } from '../src/claude/sync-run.js';
 import { savingsLine } from '../src/context/savings.js';
 import { CI_ENV_VARS } from '../src/telemetry/gate.js';
-import { writeStats, emptyStats, acquireLock, resolveContextDir } from '../src/claude/state.js';
+import { writeStats, emptyStats, acquireLock, releaseLock, resolveContextDir } from '../src/claude/state.js';
+import { buildGraph } from '../src/graph/build.js';
 
 test('underGraft detects edits inside graft/', () => {
   assert.equal(underGraft('/repo', '/repo/graft/x.md'), true);
@@ -36,13 +37,52 @@ test('post-edit ignores edits inside graft/', async () => {
   assert.equal(readStats(d), null, 'no state written for graft/ edits');
 });
 
+test("post-edit's stale count comes from a `graft check` that never rebuilds", async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-hooks-'));
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
+    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  const stub = join(d, 'check-stub.cjs');
+  const argsFile = join(d, 'args-seen.json');
+  writeFileSync(
+    stub,
+    `const fs = require('fs');\n` +
+      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n` +
+      `process.stdout.write(JSON.stringify({ context: null, graph: { changed: ['src/a.ts'], added: [], removed: [] } }));\n`,
+  );
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_TEST_CLI = stub;
+  try {
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'a.ts') } }), () => main('post-edit'));
+    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.equal(argsSeen[0], 'check');
+    // A hook lives inside a budget of seconds; a rebuild has no ceiling. And a drift
+    // report that first repairs the drift would always report zero.
+    assert.ok(argsSeen.includes('--no-refresh'), 'the child answers from the graph as it is');
+    assert.equal(readStats(d)!.staleCount, 1);
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
 // helper: hooks.ts reads process.env.GRAFT_TEST_STDIN first (test seam), else fd 0.
 async function runWithStdin(text: string, fn: () => Promise<void>): Promise<void> {
   process.env.GRAFT_TEST_STDIN = text;
   try { await fn(); } finally { delete process.env.GRAFT_TEST_STDIN; }
 }
 
-test('post-edit-sync marks dirty and kicks off the background sync', async () => {
+/** Poll for a detached child's side effect; false if it never shows within `ms`. */
+async function waitFor(check: () => boolean, ms = 3000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return check();
+}
+
+test('post-edit-sync marks dirty and hands the rebuild to a detached sync-run', async () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-hooks-'));
   mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
   writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
@@ -50,18 +90,24 @@ test('post-edit-sync marks dirty and kicks off the background sync', async () =>
   process.env.CLAUDE_PROJECT_DIR = d;
   // handleStop's spawn path is gated on the sync-run script existing (real installs resolve it
   // via claudeScriptPath('sync-run.js') next to this module). GRAFT_TEST_SYNC_RUN is a test seam
-  // (mirrors GRAFT_TEST_STDIN) that lets us point handleStop at a no-op stub inside this test's
-  // own sandbox dir, so nothing is written into src/claude/.
-  const syncRun = join(d, 'sync-run-stub.js');
-  writeFileSync(syncRun, '// test stub: spawned as a detached no-op child\n');
+  // (mirrors GRAFT_TEST_STDIN) that lets us point handleStop at a stub inside this test's own
+  // sandbox dir, so nothing is written into src/claude/. The stub records that it ran and with
+  // what; the real one takes the lock and decides whether to build (covered by the runSync tests).
+  const marker = join(d, 'sync-run-spawned');
+  const syncRun = join(d, 'sync-run-stub.cjs');
+  writeFileSync(syncRun, `require('fs').writeFileSync(${JSON.stringify(marker)}, process.argv[2]);\n`);
   process.env.GRAFT_TEST_SYNC_RUN = syncRun;
   try {
     const stdin = JSON.stringify({ tool_input: { file_path: join(d, 'src', 'auth.ts') } });
     await runWithStdin(stdin, () => main('post-edit-sync'));
     const s = readStats(d)!;
     assert.equal(s.dirty, true, 'post-edit half ran');
-    assert.equal(s.syncing, true, 'stop half ran');
-    assert.equal(existsSync(join(d, 'graft', '.cache', '.sync.lock')), true, 'sync lock file exists');
+    assert.equal(await waitFor(() => existsSync(marker)), true, 'stop half spawned sync-run');
+    assert.equal(readFileSync(marker, 'utf8'), d, 'with the project dir as its argument');
+    // A hand-off only. A lock taken under the hook's pid would read as abandoned the
+    // moment the hook exited, while the child it was taken for was still building.
+    assert.equal(s.syncing, false, 'the hook flips no flag: the child decides whether to build');
+    assert.equal(existsSync(join(d, 'graft', '.cache', '.sync.lock')), false, 'and takes no lock');
   } finally {
     delete process.env.GRAFT_TEST_SYNC_RUN;
   }
@@ -77,11 +123,10 @@ test('post-edit-sync on a file under graft/ does not mark dirty', async () => {
   assert.equal(s === null || s.dirty === false, true, 'dirty not newly set by this call');
 });
 
-test('runSync clears dirty/syncing, recomputes stats, releases lock', () => {
+test('runSync takes the lock itself, clears dirty/syncing, recomputes stats, releases lock', () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-sync-'));
   mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
-  writeStats(d, { ...emptyStats(), dirty: true, syncing: true, staleCount: 3 });
-  acquireLock(d);
+  writeStats(d, { ...emptyStats(), dirty: true, syncing: false, staleCount: 3 });
   // fake build: write a fresh wiring.json with 2 nodes, 1 ready
   const fakeBuild = (dir: string) => writeFileSync(join(dir, 'graft', '.graph', 'wiring.json'),
     JSON.stringify({ meta: { nodeCount: 2, edgeCount: 1, languages: ['typescript'] },
@@ -96,6 +141,44 @@ test('runSync clears dirty/syncing, recomputes stats, releases lock', () => {
   assert.equal(s.readyCount, 1);
   assert.ok(s.syncedAt);
   assert.equal(acquireLock(d), true, 'lock released, so reacquire succeeds');
+  releaseLock(d);
+});
+
+test('runSync stands down while another live process holds the lock', () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-sync-'));
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeStats(d, { ...emptyStats(), dirty: true });
+  assert.equal(acquireLock(d), true, 'this process is the live holder');
+  let built = 0;
+  runSync(d, () => { built++; });
+  assert.equal(built, 0, 'no second rebuild on top of the first');
+  assert.equal(readStats(d)!.dirty, true, 'and nothing was marked done');
+  releaseLock(d);
+});
+
+/**
+ * `dirty` only knows about the agent's own edits. Everything else that moves the
+ * tree — a branch switch, an editor save, `git pull` — used to be repaired by a
+ * query's inline refresh, which no hook runs any more. The end-of-turn sync probes
+ * for it instead, so an outside edit is fixed at the next turn boundary.
+ */
+test('runSync rebuilds on drift the agent did not cause, and stands down when there is none', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-sync-drift-'));
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b;\n}\n');
+  await buildGraph(d);
+  writeStats(d, { ...emptyStats(), dirty: false });
+
+  let built = 0;
+  runSync(d, () => { built++; });
+  assert.equal(built, 0, 'a clean tree costs no build');
+
+  writeFileSync(join(d, 'src', 'more.ts'), 'export function mul(a: number, b: number): number {\n  return a * b;\n}\n');
+  runSync(d, () => { built++; });
+  assert.equal(built, 1, 'an edit nobody flagged still gets its rebuild');
+  assert.equal(readStats(d)!.dirty, false);
+  assert.equal(acquireLock(d), true, 'lock released either way');
+  releaseLock(d);
 });
 
 test("runSync's default build passes --dir <resolved> to graft build when GRAFT_DIR is set", () => {
@@ -125,25 +208,25 @@ test("runSync's default build passes --dir <resolved> to graft build when GRAFT_
 
 test('runSync clears syncing even if build throws (money-safe failure)', () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-sync-'));
-  writeStats(d, { ...emptyStats(), dirty: true, syncing: true });
-  acquireLock(d);
+  writeStats(d, { ...emptyStats(), dirty: true });
   runSync(d, () => { throw new Error('build failed'); });
   const s = readStats(d)!;
   assert.equal(s.syncing, false);
   assert.equal(s.dirty, true, 'stays dirty so the bar keeps ⚠ and it retries next turn');
   assert.equal(acquireLock(d), true, 'lock always released');
+  releaseLock(d);
 });
 
 test('runSync stays dirty when build succeeds but wiring is unreadable', () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-sync-'));
-  writeStats(d, { ...emptyStats(), dirty: true, syncing: true, staleCount: 2 });
-  acquireLock(d);
+  writeStats(d, { ...emptyStats(), dirty: true, staleCount: 2 });
   runSync(d, () => { /* build "succeeds" but writes no wiring.json */ });
   const s = readStats(d)!;
   assert.equal(s.syncing, false);
   assert.equal(s.dirty, true, 'unreadable wiring → stay dirty, retry next turn');
   assert.equal(s.syncedAt, null, 'not marked synced');
   assert.equal(acquireLock(d), true, 'lock released');
+  releaseLock(d);
 });
 
 // ── lastFileScopeHint (the "you're working in backend/, weight it" hint) ──
@@ -300,6 +383,9 @@ test('prompt hook passes --in <scope> when lastFile resolves to a scope on a mul
     const inIdx = argsSeen.indexOf('--in');
     assert.ok(inIdx !== -1, 'the ask call carries --in');
     assert.equal(argsSeen[inIdx + 1], 'backend', 'narrowed to the scope lastFile (app.py) resolves to');
+    // A hook never rebuilds: measured 41s against a cold cache on a 6.5k-file repo,
+    // inside a 15s budget, after which the host discarded the pack it had waited for.
+    assert.ok(argsSeen.includes('--no-refresh'), 'the ask answers from the graph as it is');
   } finally {
     delete process.env.GRAFT_TEST_CLI;
     delete process.env.CLAUDE_PROJECT_DIR;
@@ -597,12 +683,15 @@ test('promptAskTimeout is derived from the installed hook budget', () => {
   const previous = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'graft-nouser-'));
   try {
-    // A repo wired before the budget was raised.
-    assert.equal(promptAskTimeout(withSettings(8000)), 6000);
-    // A repo wired after.
-    assert.equal(promptAskTimeout(withSettings(15000)), 13000);
+    // Written by a current `graft init`: seconds, the unit Claude Code reads.
+    assert.equal(promptAskTimeout(withSettings(8)), 6000);
+    assert.equal(promptAskTimeout(withSettings(15)), 13000);
     // Never so small the child has no chance.
-    assert.equal(promptAskTimeout(withSettings(1000)), 4000);
+    assert.equal(promptAskTimeout(withSettings(1)), 4000);
+    // Written by an init before 0.19, which used milliseconds (#283), and never
+    // rewritten since: still read as the budget it is.
+    assert.equal(promptAskTimeout(withSettings(8000)), 6000);
+    assert.equal(promptAskTimeout(withSettings(15000)), 13000);
 
     // Nothing readable: assume the conservative 8s budget the other hooks carry.
     assert.equal(promptAskTimeout(withSettings(undefined)), 6000);
@@ -632,16 +721,20 @@ function withUserSettings(timeout: unknown): string {
 test('promptAskTimeout reads a user-level hook when the repo declares none', () => {
   const previous = process.env.CLAUDE_CONFIG_DIR;
   try {
-    process.env.CLAUDE_CONFIG_DIR = withUserSettings(15000);
+    process.env.CLAUDE_CONFIG_DIR = withUserSettings(15);
     // A repo with no .claude/ of its own still gets the budget it truly runs under.
     assert.equal(promptAskTimeout(mkdtempSync(join(tmpdir(), 'graft-nosettings-'))), 13000);
 
     // Declared in both places: Claude Code fires both entries and this process
     // cannot tell which launched it, so the smallest budget is the only safe one.
-    assert.equal(promptAskTimeout(withSettings(8000)), 6000);
+    assert.equal(promptAskTimeout(withSettings(8)), 6000);
 
-    process.env.CLAUDE_CONFIG_DIR = withUserSettings(8000);
-    assert.equal(promptAskTimeout(withSettings(15000)), 6000);
+    process.env.CLAUDE_CONFIG_DIR = withUserSettings(8);
+    assert.equal(promptAskTimeout(withSettings(15)), 6000);
+    // Units never mix the comparison up: a legacy 8000ms repo entry is still the
+    // smaller budget next to a 15s user-level one.
+    process.env.CLAUDE_CONFIG_DIR = withUserSettings(15);
+    assert.equal(promptAskTimeout(withSettings(8000)), 6000);
 
     // Nothing anywhere still means the conservative default.
     process.env.CLAUDE_CONFIG_DIR = withUserSettings(undefined);

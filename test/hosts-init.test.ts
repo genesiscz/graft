@@ -6,7 +6,6 @@ import assert from 'node:assert/strict';
 process.env.GRAFT_MCP_NPX = '1';
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, sep } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { runHostsInit } from '../src/hosts/init.js';
 import { toPosixPath } from '../src/util/paths.js';
 import { runCli, tmpRepo } from './helpers.js';
@@ -54,21 +53,23 @@ test('preserves user content around the fenced section', () => {
   assert.ok(text.includes('graft ask'));
 });
 
+// Every CLI run below goes through `runCli` with a scratch `home`, never a bare
+// `execFileSync`. `graft init` retracts every host NOT selected, at the user level
+// too, and the real CLI resolves `~` from the environment: on 2026-09-16 these tests
+// ran against a developer's real home, deleted their ~/.claude/helpers/graft-hooks.cjs
+// and `mcpServers.graft`, and rewrote the shim with this checkout's path baked in.
+
 test('CLI: graft init --agents gemini writes GEMINI.md and exits 0', () => {
-  const repo = fresh();
-  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'init', repo, '--no-build', '--agents', 'gemini'], {
-    encoding: 'utf8',
-  });
+  const home = fresh(); const repo = fresh();
+  const res = runCli(['init', repo, '--no-build', '--agents', 'gemini'], { home });
+  assert.equal(res.status, 0, res.describe());
   assert.ok(readFileSync(join(repo, 'GEMINI.md'), 'utf8').includes('graft ask'));
 });
 
 test('CLI: unknown agent id exits non-zero', () => {
-  const repo = fresh();
-  assert.throws(() =>
-    execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'init', repo, '--no-build', '--agents', 'nope'], {
-      encoding: 'utf8', stdio: 'pipe',
-    }),
-  );
+  const home = fresh(); const repo = fresh();
+  const res = runCli(['init', repo, '--no-build', '--agents', 'nope'], { home });
+  assert.notEqual(res.status, 0, res.describe());
 });
 
 test('explicit empty agents list writes nothing, even when home has agent dirs (no fallback to detection)', () => {
@@ -80,10 +81,9 @@ test('explicit empty agents list writes nothing, even when home has agent dirs (
 });
 
 test('CLI: --agents claude with --no-build writes .claude/ but no other-agent files', () => {
-  const repo = fresh();
-  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'init', repo, '--no-build', '--agents', 'claude'], {
-    encoding: 'utf8',
-  });
+  const home = fresh(); const repo = fresh();
+  const res = runCli(['init', repo, '--no-build', '--agents', 'claude'], { home });
+  assert.equal(res.status, 0, res.describe());
   assert.ok(existsSync(join(repo, '.claude')));
   assert.ok(!existsSync(join(repo, 'AGENTS.md')));
   assert.ok(!existsSync(join(repo, 'GEMINI.md')));
@@ -91,14 +91,9 @@ test('CLI: --agents claude with --no-build writes .claude/ but no other-agent fi
 });
 
 test('CLI: --agents claude gemini nope exits non-zero and leaves repo untouched (validation before writes)', () => {
-  const repo = fresh();
-  assert.throws(() =>
-    execFileSync(
-      process.execPath,
-      ['--import', 'tsx', 'src/cli.ts', 'init', repo, '--no-build', '--agents', 'claude', 'gemini', 'nope'],
-      { encoding: 'utf8', stdio: 'pipe' },
-    ),
-  );
+  const home = fresh(); const repo = fresh();
+  const res = runCli(['init', repo, '--no-build', '--agents', 'claude', 'gemini', 'nope'], { home });
+  assert.notEqual(res.status, 0, res.describe());
   assert.ok(!existsSync(join(repo, '.claude')));
   assert.ok(!existsSync(join(repo, 'GEMINI.md')));
   assert.ok(!existsSync(join(repo, 'AGENTS.md')));
@@ -123,8 +118,9 @@ test('mcp: false skips MCP registration', () => {
 });
 
 test('CLI: --no-mcp writes the rule file but no MCP config', () => {
-  const repo = fresh();
-  execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'init', repo, '--no-build', '--agents', 'cursor', '--no-mcp'], { encoding: 'utf8' });
+  const home = fresh(); const repo = fresh();
+  const res = runCli(['init', repo, '--no-build', '--agents', 'cursor', '--no-mcp'], { home });
+  assert.equal(res.status, 0, res.describe());
   assert.ok(existsSync(join(repo, '.cursor', 'rules', 'graft.mdc')));
   assert.ok(!existsSync(join(repo, '.cursor', 'mcp.json')));
 });

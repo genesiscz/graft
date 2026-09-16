@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, existsSync, mkdirSync, readdirSync, utimesSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -47,6 +48,33 @@ test('acquireLock reclaims a stale lock', () => {
   const old = (Date.now() - LOCK_STALE_MS - 1000) / 1000;
   utimesSync(p, old, old);
   assert.equal(acquireLock(d), true, 'stale lock reclaimed');
+});
+
+/**
+ * The lock names its pid. A holder dies without unwinding all the time — the host's
+ * hard kill at a hook budget, a session closing over a detached sync — and until now
+ * nothing could tell that file from a live rebuild for LOCK_STALE_MS: five minutes in
+ * which every query answered stale and the background sync stood down.
+ */
+test('acquireLock reclaims a lock whose owner is dead, without waiting', () => {
+  const d = fresh();
+  mkdirSync(cacheDir(d), { recursive: true });
+  // A pid that existed a moment ago and is gone now, exactly what a killed holder
+  // leaves behind. A short-lived child is the honest way to get one.
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid;
+  const p = join(cacheDir(d), '.sync.lock');
+  writeFileSync(p, JSON.stringify({ pid: dead, at: new Date().toISOString() }));
+  assert.equal(acquireLock(d), true, 'a dead owner does not hold the lock');
+  assert.equal(JSON.parse(readFileSync(p, 'utf8')).pid, process.pid, 'and it is ours now');
+});
+
+test('acquireLock honours a fresh lock held by a live process that is not us', () => {
+  const d = fresh();
+  mkdirSync(cacheDir(d), { recursive: true });
+  const p = join(cacheDir(d), '.sync.lock');
+  // The parent of this test process is alive for as long as we are.
+  writeFileSync(p, JSON.stringify({ pid: process.ppid, at: new Date().toISOString() }));
+  assert.equal(acquireLock(d), false, 'a live owner keeps the lock');
 });
 
 test('writeJsonAtomic leaves no scratch file behind when the write fails', () => {

@@ -14,7 +14,7 @@ import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "../src/graph
 import { extractCachePath } from "../src/graph/extract-cache.js";
 import { fingerprintPath, isClean, probeDrift } from "../src/graph/fingerprint.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
-import { acquireLock, readStats, releaseLock, writeStats, emptyStats } from "../src/util/state.js";
+import { acquireLock, acquireLockIn, readStats, releaseLock, writeStats, emptyStats } from "../src/util/state.js";
 import { callTool } from "../src/mcp/tools.js";
 import type { GraphV1 } from "../src/graph/types.js";
 import { chmodDenialUnavailable } from "./helpers.js";
@@ -431,23 +431,26 @@ test("callTool refreshes before answering — except for graft_check_freshness",
   assert.ok(!again.text.startsWith("[graft] refreshed"), "nothing moved — no note, no rebuild");
 });
 
-test("a process killed while holding the lock releases it", async (t) => {
-  // Windows has no SIGTERM: `child.kill()` there calls TerminateProcess, so no
-  // handler runs and nothing can release the lock on the way out. The safety net on
-  // that platform is the stale-lock reclaim (`LOCK_STALE_MS`), covered above.
+test("a refresh killed mid-build dies at once, and its lock does not block the next one", async (t) => {
+  // Windows: kill() terminates without a signal to report, so the timing half of
+  // this cannot be asserted there. The dead-owner reclaim itself is covered in
+  // claude-state.test.ts on every platform.
   if (process.platform === "win32") {
-    return t.skip("no SIGTERM on Windows — kill() terminates without unwinding, so a handler cannot run");
+    return t.skip("kill() on Windows reports no signal; the reclaim is covered in claude-state.test.ts");
   }
   const d = repo();
   const cache = join(outOf(d), ".cache");
   mkdirSync(cache, { recursive: true });
   const lock = join(cache, ".sync.lock");
 
-  // `execFileSync(..., { timeout })` — which is how the Claude Code prompt hook runs
-  // `graft ask` — enforces its timeout with SIGTERM, and node's default disposition
-  // for that is to exit without unwinding. So the `finally` that releases the lock
-  // never ran, and the abandoned lock then blocked the background sync and made every
-  // query wait-then-answer-stale until it aged out.
+  // The Claude Code prompt hook runs `graft ask` under `execFileSync(..., { timeout })`,
+  // which enforces the timeout with SIGTERM. A listener installed to release the lock
+  // on the way out replaced node's default disposition, and a listener only runs
+  // between event-loop turns — so a child inside the synchronous parse loop of a
+  // rebuild ignored the signal until the build was done (41s on a 6.5k-file repo) and
+  // the host killed the whole hook at its budget instead. The shape below is that
+  // loop: the lock held, then a synchronous spin. Importing refresh.ts is part of the
+  // test: loading it must not install a process-wide listener either.
   // `file://` URLs, not native paths: a dynamic `import("D:\\…\\state.ts")` fails on
   // Windows, where ESM reads the drive letter as a URL scheme.
   const mod = (rel: string) => JSON.stringify(new URL(rel, import.meta.url).href);
@@ -455,12 +458,12 @@ test("a process killed while holding the lock releases it", async (t) => {
     process.execPath,
     ["--import", "tsx", "-e",
       `const { acquireLockIn } = await import(${mod("../src/util/state.ts")});
-       const { releaseOnSignal } = await import(${mod("../src/graph/refresh.ts")});
+       await import(${mod("../src/graph/refresh.ts")});
        const cache = process.argv[1];
        if (!acquireLockIn(cache)) { process.exit(9); }
-       releaseOnSignal(cache);
        process.stdout.write("held\\n");
-       setInterval(() => {}, 1000);`,
+       const until = Date.now() + 30000;
+       while (Date.now() < until) { /* the synchronous stretch a rebuild is */ }`,
       cache],
     { stdio: ["ignore", "pipe", "inherit"] },
   );
@@ -471,12 +474,17 @@ test("a process killed while holding the lock releases it", async (t) => {
   });
   assert.ok(existsSync(lock), "the child holds the lock");
 
+  const sentAt = Date.now();
   child.kill("SIGTERM");
   const [code, signal] = await new Promise<[number | null, string | null]>((done) =>
     child.on("exit", (c, s) => done([c, s])),
   );
+  const took = Date.now() - sentAt;
 
-  assert.ok(!existsSync(lock), "the lock must not outlive the process that took it");
-  assert.equal(signal, "SIGTERM", "and the exit still reports the signal, for whoever is waiting on us");
+  assert.ok(took < 5000, `the kill must land during the spin, not after it (took ${took}ms)`);
+  assert.equal(signal, "SIGTERM", "the exit still reports the signal, for whoever is waiting on us");
   assert.equal(code, null);
+  // Nothing could unwind, so the file is still there — and that must not matter.
+  assert.ok(existsSync(lock), "the dead process left its lock behind");
+  assert.equal(acquireLockIn(cache), true, "which is free to the next comer, at once");
 });
