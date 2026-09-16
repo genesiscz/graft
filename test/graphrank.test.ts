@@ -19,6 +19,7 @@ import {
   personalizedPageRank,
   personalizedPageRankPrepared,
   preparePageRankPartitions,
+  preparePageRankTopology,
 } from "../src/ask/graphrank.js";
 import type { GraphV1, NodeV1, EdgeV1, Relation } from "../src/graph/types.js";
 
@@ -322,4 +323,120 @@ test("ask: graph-rank is on by default (same as graphRank:true)", async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── The CSR iteration must be the map iteration, exactly ─────────────────────
+
+/**
+ * The power iteration walks a compressed-sparse-row adjacency over integer indices
+ * rather than a Map keyed by node id, because the iteration is the entire cost of a
+ * re-rank (measured on a 39k-node graph: 12-24ms to prepare the topology against
+ * 203-285ms to iterate it, ~4.5M string-keyed Map operations).
+ *
+ * This pins the thing that change could have broken: the ranking it produces. The
+ * oracle below is the previous implementation verbatim. Against the real graph, all
+ * eight sampled queries agreed on the top 100 with a worst score delta of 3.3e-16 —
+ * float noise — so anything worse than "same order, deltas at epsilon" here is a
+ * regression, not a rounding difference.
+ */
+function mapBasedPageRank(
+  topology: { ids: ReadonlySet<string>; adjacency: ReadonlyMap<string, readonly string[]> },
+  seeds: Map<string, number>,
+  opts: { alpha?: number; iters?: number } = {},
+): Map<string, number> {
+  const alpha = opts.alpha ?? 0.25;
+  const iters = opts.iters ?? 25;
+  const { ids, adjacency } = topology;
+  let seedTotal = 0;
+  for (const [id, w] of seeds) if (ids.has(id) && w > 0) seedTotal += w;
+  if (seedTotal <= 0) return new Map();
+  const restart = new Map<string, number>();
+  for (const [id, w] of seeds) if (ids.has(id) && w > 0) restart.set(id, w / seedTotal);
+  let rank = new Map(restart);
+  for (let i = 0; i < iters; i++) {
+    const next = new Map<string, number>();
+    for (const [id, r] of restart) next.set(id, alpha * r);
+    let dangling = 0;
+    for (const [id, mass] of rank) {
+      const nbrs = adjacency.get(id);
+      if (!nbrs || nbrs.length === 0) {
+        dangling += mass;
+        continue;
+      }
+      const share = ((1 - alpha) * mass) / nbrs.length;
+      for (const nb of nbrs) next.set(nb, (next.get(nb) ?? 0) + share);
+    }
+    if (dangling > 0) {
+      const dm = (1 - alpha) * dangling;
+      for (const [sid, r] of restart) next.set(sid, (next.get(sid) ?? 0) + dm * r);
+    }
+    rank = next;
+  }
+  let max = 0;
+  for (const v of rank.values()) if (v > max) max = v;
+  if (max <= 0) return new Map();
+  const out = new Map<string, number>();
+  for (const [id, v] of rank) out.set(id, v / max);
+  return out;
+}
+
+test("the CSR iteration ranks identically to the map iteration it replaced", () => {
+  // A graph with the shapes that exercise every branch: a hub cluster, a chain, a
+  // dangling node with no walk edges, and a node nothing reaches.
+  const ids = ["hub", "a", "b", "c", "chain1", "chain2", "chain3", "dangling", "island"];
+  const g = graphOf(ids, [
+    edge("hub", "a"),
+    edge("hub", "b"),
+    edge("hub", "c"),
+    edge("a", "b"),
+    edge("chain1", "chain2"),
+    edge("chain2", "chain3"),
+    edge("c", "chain1"),
+  ]);
+  const topology = preparePageRankTopology(g);
+
+  for (const seeds of [
+    new Map([["hub", 1]]),
+    new Map([["island", 1]]),
+    new Map([["dangling", 1]]),
+    new Map([
+      ["chain3", 1],
+      ["hub", 0.5],
+    ]),
+    // A seed that is not in the graph at all, beside one that is.
+    new Map([
+      ["nope", 5],
+      ["a", 1],
+    ]),
+  ]) {
+    const expected = mapBasedPageRank(topology, seeds);
+    const actual = personalizedPageRankPrepared(topology, seeds);
+    const key = [...seeds.keys()].join("+");
+
+    assert.deepEqual(
+      [...actual.keys()].sort(),
+      [...expected.keys()].sort(),
+      `${key}: the same node set carries mass`,
+    );
+    for (const [id, score] of expected) {
+      // Float noise is allowed; a different ranking is not.
+      assert.ok(
+        Math.abs((actual.get(id) ?? 0) - score) < 1e-12,
+        `${key}: ${id} scored ${actual.get(id)}, expected ${score}`,
+      );
+    }
+    const order = (m: Map<string, number>) =>
+      [...m.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])).map(([id]) => id);
+    assert.deepEqual(order(actual), order(expected), `${key}: identical ranking order`);
+  }
+});
+
+test("an empty topology and an all-zero seed set stay empty rather than throwing", () => {
+  const empty = preparePageRankTopology(graphOf([], []));
+  assert.equal(personalizedPageRankPrepared(empty, new Map([["a", 1]])).size, 0);
+
+  const g = preparePageRankTopology(graphOf(["a", "b"], [edge("a", "b")]));
+  assert.equal(personalizedPageRankPrepared(g, new Map()).size, 0, "no seeds");
+  assert.equal(personalizedPageRankPrepared(g, new Map([["a", 0]])).size, 0, "zero-weight seed");
+  assert.equal(personalizedPageRankPrepared(g, new Map([["ghost", 1]])).size, 0, "unknown seed");
 });
