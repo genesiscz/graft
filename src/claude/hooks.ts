@@ -11,6 +11,7 @@ import { runUpkeep } from '../upkeep-run.js';
 import { runningVersion } from '../upkeep.js';
 import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js';
 import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
+import { driftCount, probeDrift } from '../graph/fingerprint.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { classifyToolUse, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
 
@@ -124,12 +125,11 @@ function installedHookTimeout(dir: string, event: string): number | null {
 }
 
 /**
- * Append `--dir <contextDir>` for the hooks' own `graft ask`/`graft check`
- * children — the one place in this file that spawns the CLI itself rather
- * than reading `graft/` off disk (which already resolves through
- * `resolveContextDir` inside `util/state.ts` and `claude/stats.ts`). A no-op
- * when `GRAFT_DIR` isn't set, so an unconfigured repo's spawned CLI sees
- * byte-identical argv to before this existed.
+ * Append `--dir <contextDir>` for the prompt hook's `graft ask` child — the one
+ * place in this file that spawns the CLI at all, rather than reading `graft/` off
+ * disk (which already resolves through `resolveContextDir` inside `util/state.ts`
+ * and `claude/stats.ts`). A no-op when `GRAFT_DIR` isn't set, so an unconfigured
+ * repo's spawned CLI sees byte-identical argv to before this existed.
  */
 function withContextDirArg(dir: string, args: string[]): string[] {
   return process.env.GRAFT_DIR ? [...args, '--dir', resolveContextDir(dir)] : args;
@@ -138,16 +138,16 @@ function withContextDirArg(dir: string, args: string[]): string[] {
 function graftJson(dir: string, args: string[], timeout: number = CHILD_TIMEOUT_MS): any | null {
   try {
     // GRAFT_TEST_CLI is a test seam (mirrors GRAFT_TEST_STDIN/GRAFT_TEST_SYNC_RUN) so
-    // tests can point the prompt hook's `graft ask`/`graft check` calls at a stub
-    // script and observe the exact args it was invoked with, instead of shelling
-    // out to the real CLI (which isn't built relative to the TS source under test).
+    // tests can point the prompt hook's `graft ask` call at a stub script and observe
+    // the exact args it was invoked with, instead of shelling out to the real CLI
+    // (which isn't built relative to the TS source under test).
     const cliPath = process.env.GRAFT_TEST_CLI ?? graftCliPath();
     const out = execFileSync(process.execPath, [cliPath, ...args],
       { cwd: dir, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
     return JSON.parse(out);
   } catch (e: any) {
-    // `graft check` exits non-zero when the graph is stale (by design) but still
-    // prints valid JSON to stdout; recover it from the thrown error before giving up.
+    // A command that exits non-zero can still have printed valid JSON to stdout;
+    // recover it from the thrown error before giving up.
     if (e && typeof e.stdout === 'string' && e.stdout.trim()) {
       try { return JSON.parse(e.stdout); } catch { /* not JSON — fall through */ }
     }
@@ -155,19 +155,39 @@ function graftJson(dir: string, args: string[], timeout: number = CHILD_TIMEOUT_
   }
 }
 /**
- * `--no-refresh` on every child a hook spawns. A hook lives inside a budget of
- * seconds, and a query's pre-answer refresh (`graph/refresh.ts`) is a rebuild with
- * no ceiling: measured on a 6.5k-file repo, 3.5s with a warm extraction cache and
- * 41s with a cold one, against a 15s budget — after which the host killed the hook
- * and discarded its output, so the turn paid the wait AND lost the pack. The
- * detached end-of-turn sync (`sync-run.ts`) owns rebuilding; a hook only reads.
+ * `--no-refresh` on the hook's `graft ask`. A hook lives inside a budget of seconds,
+ * and a query's pre-answer refresh (`graph/refresh.ts`) is a rebuild with no ceiling:
+ * measured on a 6.6k-file repo, 2.3s with a warm extraction cache and 37.8s with a
+ * cold one, against a 15s budget — after which the host killed the hook and discarded
+ * its output, so the turn paid the wait AND lost the pack. The detached end-of-turn
+ * sync (`sync-run.ts`) owns rebuilding.
+ *
+ * Only the query commands declare this flag. `check` is the drift REPORT and never
+ * refreshes, so commander rejects the option there — it would exit 1 with no stdout.
  */
 const NO_REFRESH = '--no-refresh';
 
-function checkStaleCount(dir: string): number {
-  const r = graftJson(dir, withContextDirArg(dir, ['check', '.', '--json', NO_REFRESH]));
-  const g = r?.graph ?? {};
-  return (g.changed?.length ?? 0) + (g.added?.length ?? 0) + (g.removed?.length ?? 0);
+/**
+ * How many files have moved since the last build, for the statusline's `⚠ N stale`.
+ *
+ * In-process, from the same stat-based probe `ensureFreshGraph` uses to decide whether
+ * to rebuild, so the bar and the rebuild can never disagree. This used to spawn `graft
+ * check --json`, which re-hashes every file AND diffs every markdown card: 35.2s on a
+ * 6.6k-file repo, against a child cap of 8s. So it was killed on every single edit,
+ * `graftJson` returned null, and the bar read `0` — 8.2s of dead wall clock per edit
+ * buying a number that was always wrong. The probe is 85ms on the same repo and
+ * returns the real count (#366).
+ *
+ * Null means no fingerprint (a graph from before probes existed): report 0 rather
+ * than guessing, the next build lays one down.
+ */
+function staleCount(dir: string): number {
+  try {
+    const drift = probeDrift(dir, resolveContextDir(dir));
+    return drift ? driftCount(drift) : 0;
+  } catch {
+    return 0; // a statusline number is never worth failing an edit hook over
+  }
 }
 function emit(eventName: string, additionalContext: string): void {
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext } }));
@@ -199,7 +219,7 @@ export function editedFilePath(input: any, dir: string): string | null {
 async function handlePostEdit(input: any, dir: string): Promise<void> {
   const file = editedFilePath(input, dir);
   if (!file || underGraft(dir, file)) return;
-  patchStats(dir, { dirty: true, staleCount: checkStaleCount(dir), lastFile: basename(file) });
+  patchStats(dir, { dirty: true, staleCount: staleCount(dir), lastFile: basename(file) });
   const w = readWiring(dir);
   if (w) { const br = formatBlastRadius(w, file); if (br) emit('PostToolUse', br); }
 }

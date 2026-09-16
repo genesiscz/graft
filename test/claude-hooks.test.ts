@@ -10,6 +10,7 @@ import { savingsLine } from '../src/context/savings.js';
 import { CI_ENV_VARS } from '../src/telemetry/gate.js';
 import { writeStats, emptyStats, acquireLock, releaseLock, resolveContextDir } from '../src/claude/state.js';
 import { buildGraph } from '../src/graph/build.js';
+import { runCli } from './helpers.js';
 
 test('underGraft detects edits inside graft/', () => {
   assert.equal(underGraft('/repo', '/repo/graft/x.md'), true);
@@ -37,29 +38,39 @@ test('post-edit ignores edits inside graft/', async () => {
   assert.equal(readStats(d), null, 'no state written for graft/ edits');
 });
 
-test("post-edit's stale count comes from a `graft check` that never rebuilds", async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-hooks-'));
-  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
-  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
-    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
-  const stub = join(d, 'check-stub.cjs');
-  const argsFile = join(d, 'args-seen.json');
-  writeFileSync(
-    stub,
-    `const fs = require('fs');\n` +
-      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n` +
-      `process.stdout.write(JSON.stringify({ context: null, graph: { changed: ['src/a.ts'], added: [], removed: [] } }));\n`,
-  );
+/**
+ * The bar's `⚠ N stale` is counted in-process, and the edit hook spawns nothing.
+ *
+ * It used to run `graft check --json`, which re-hashes every file AND diffs every
+ * markdown card — 35.2s on a 6.6k-file repo against a child cap of 8s. So it was
+ * killed on every single edit and the count read 0: 8.2s of dead wall clock per edit
+ * for a number that was always wrong. A stub CLI hid it, because a stub answers any
+ * argv in microseconds; this test fails the moment a child is spawned at all.
+ */
+test('post-edit counts drift in-process and spawns no child', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-hooks-stale-'));
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b;\n}\n');
+  await buildGraph(d); // lays down the fingerprint the probe reads
+
+  // Two files moved since that build: one edited, one new.
+  writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b + 0;\n}\n');
+  writeFileSync(join(d, 'src', 'more.ts'), 'export function mul(a: number, b: number): number {\n  return a * b;\n}\n');
+
+  // Any spawn at all fails the test: this stub records the call and returns nothing
+  // useful, so a hook that still shells out both trips the assertion and reads 0.
+  // It lives OUTSIDE the repo — a .cjs written inside it is a source file, and the
+  // drift count would include the test's own scaffolding.
+  const aside = mkdtempSync(join(tmpdir(), 'graft-stub-'));
+  const spawned = join(aside, 'spawned');
+  const stub = join(aside, 'never-run.cjs');
+  writeFileSync(stub, `require('fs').writeFileSync(${JSON.stringify(spawned)}, 'x');\n`);
   process.env.CLAUDE_PROJECT_DIR = d;
   process.env.GRAFT_TEST_CLI = stub;
   try {
-    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'a.ts') } }), () => main('post-edit'));
-    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.equal(argsSeen[0], 'check');
-    // A hook lives inside a budget of seconds; a rebuild has no ceiling. And a drift
-    // report that first repairs the drift would always report zero.
-    assert.ok(argsSeen.includes('--no-refresh'), 'the child answers from the graph as it is');
-    assert.equal(readStats(d)!.staleCount, 1);
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'math.ts') } }), () => main('post-edit'));
+    assert.equal(existsSync(spawned), false, 'the edit hook must not spawn a CLI child');
+    assert.equal(readStats(d)!.staleCount, 2, 'and it reports the real drift, not 0');
   } finally {
     delete process.env.GRAFT_TEST_CLI;
     delete process.env.CLAUDE_PROJECT_DIR;
@@ -796,31 +807,26 @@ test('prompt hook omits --dir when GRAFT_DIR is unset (byte-identical argv to be
   }
 });
 
-test('post-edit passes --dir <resolved> to graft check when GRAFT_DIR is set', async () => {
+/**
+ * The in-process count has to respect a relocated context dir for the same reason
+ * the `--dir` argument did: `GRAFT_DIR` moves the fingerprint the probe reads. It
+ * used to be a `graft check` child carrying `--dir <resolved>`; the probe reaches the
+ * same place through `resolveContextDir`, and reads 0 from the wrong one.
+ */
+test('post-edit counts drift against a GRAFT_DIR-relocated context dir', async () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-postedit-dir-'));
-  mkdirSync(join(d, 'elsewhere', '.graph'), { recursive: true });
-  writeFileSync(join(d, 'elsewhere', '.graph', 'wiring.json'),
-    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
-  const stub = join(d, 'check-stub.cjs');
-  const argsFile = join(d, 'args-seen.json');
-  writeFileSync(
-    stub,
-    `const fs = require('fs');\n` +
-      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n` +
-      `process.stdout.write(JSON.stringify({ graph: { changed: [], added: [], removed: [] } }));\n`,
-  );
-  process.env.CLAUDE_PROJECT_DIR = d;
-  process.env.GRAFT_TEST_CLI = stub;
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b;\n}\n');
   process.env.GRAFT_DIR = 'elsewhere';
+  process.env.CLAUDE_PROJECT_DIR = d;
   try {
-    const stdin = JSON.stringify({ tool_input: { file_path: join(d, 'src', 'auth.ts') } });
-    await runWithStdin(stdin, () => main('post-edit'));
-    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    const dirIdx = argsSeen.indexOf('--dir');
-    assert.ok(dirIdx !== -1, 'the check call carries --dir when GRAFT_DIR is set');
-    assert.equal(argsSeen[dirIdx + 1], resolveContextDir(d));
+    await buildGraph(d, { contextDir: resolveContextDir(d) });
+    assert.equal(existsSync(join(d, 'elsewhere', '.graph', 'wiring.json')), true, 'built into the relocated dir');
+    writeFileSync(join(d, 'src', 'more.ts'), 'export function mul(a: number, b: number): number {\n  return a * b;\n}\n');
+
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'more.ts') } }), () => main('post-edit'));
+    assert.equal(readStats(d)!.staleCount, 1, 'the probe read the relocated fingerprint');
   } finally {
-    delete process.env.GRAFT_TEST_CLI;
     delete process.env.CLAUDE_PROJECT_DIR;
     delete process.env.GRAFT_DIR;
   }

@@ -4,9 +4,9 @@
 
 ### Fixed
 
-- **The Claude Code hooks no longer rebuild the graph inline** (#366, including the
-  33.9s tail it could not trace). The prompt and post-edit hooks ask `--no-refresh`,
-  and the detached end-of-turn sync, which has no seconds budget, owns every rebuild.
+- **The Claude Code hooks no longer rebuild the graph inline.** The prompt hook's
+  `graft ask` asks `--no-refresh`, and the detached end-of-turn sync, which has no
+  seconds budget, owns every rebuild.
   It now runs after every turn and probes for drift the agent did not cause (a branch
   switch, an editor save), so that case is still repaired. Measured on a 6.5k-file
   repo: a prompt hook that took 41s and returned nothing against a cold extraction
