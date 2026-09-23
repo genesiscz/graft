@@ -12,6 +12,10 @@ import { runningVersion } from '../upkeep.js';
 import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js';
 import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
 import { driftCount, probeDrift } from '../graph/fingerprint.js';
+import { hasGraftIndex } from '../graph/root.js';
+import { mainWorktreeRoot } from '../graph/seed.js';
+import { workspacePath } from '../graph/workspace.js';
+import { wiringPath } from '../graph/write.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { classifyToolUse, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
 
@@ -436,9 +440,29 @@ function handleStop(input: any, dir: string): void {
   spawnBackgroundSync(dir);
 }
 
+/**
+ * Does this project have a graph to serve, here or in the main worktree it was
+ * branched from (seeding gives a fresh worktree its graph on first query)?
+ *
+ * The user-level install fires every hook in every project Claude Code opens,
+ * indexed or not. Without this, the tool and stop hooks recorded stats and
+ * session files into a `graft/.cache/` they created in repos nobody indexed,
+ * and each call paid for loading the handler first. Cost here: two stats, plus
+ * one small file read when `.git` is a worktree pointer.
+ */
+export function hasGraph(dir: string): boolean {
+  if (existsSync(wiringPath(resolveContextDir(dir))) || existsSync(workspacePath(dir))) return true;
+  const main = mainWorktreeRoot(dir);
+  return main !== null && hasGraftIndex(main);
+}
+
 export async function main(event: string): Promise<void> {
   const input = readStdin();
   const dir = projectDir(input);
+
+  // session-start still runs without a graph: its upkeep refreshes a repo-level
+  // wiring an older graft wrote, and it writes nothing when there is none.
+  if (event !== 'session-start' && !hasGraph(dir)) return;
 
   if (event === 'session-start') {
     // Before anything is emitted: refresh this repo's wiring if it was written by

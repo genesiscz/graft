@@ -12,6 +12,14 @@ import { writeStats, emptyStats, acquireLock, releaseLock, resolveContextDir } f
 import { buildGraph } from '../src/graph/build.js';
 import { runCli } from './helpers.js';
 
+/** A project dir with a (tiny) graph: the tool and stop hooks do nothing without one. */
+function indexedDir(prefix: string): string {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'), JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  return d;
+}
+
 test('underGraft detects edits inside graft/', () => {
   assert.equal(underGraft('/repo', '/repo/graft/x.md'), true);
   assert.equal(underGraft('/repo', '/repo/src/cli.ts'), false);
@@ -486,8 +494,29 @@ test('prompt branch stays silent and writes no session when graft is not built',
   assert.equal(existsSync(join(d, 'graft', '.cache', 'session', 'p1.json')), false, 'no session file on no-op');
 });
 
+test('tool, edit and stop hooks do nothing in a project with no graph', async () => {
+  // The user-level install fires in every repo. Unindexed ones must not grow a graft/.
+  const d = mkdtempSync(join(tmpdir(), 'graft-unindexed-'));
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    const footer = { session_id: 's1', tool_name: 'Bash', tool_response: { stdout: '[graft] tokens saved ≈ 2,181 (89%)' } };
+    await runWithStdin(JSON.stringify(footer), () => main('tool-savings'));
+    await runWithStdin(JSON.stringify({ session_id: 's1', tool_name: 'Edit', tool_input: { file_path: join(d, 'a.ts') } }), () => main('post-edit'));
+    await runWithStdin(JSON.stringify({ session_id: 's1' }), () => main('stop'));
+    assert.equal(existsSync(join(d, 'graft')), false);
+
+    // Negative control: the same footer in an indexed project IS recorded.
+    const e = indexedDir('graft-indexed-');
+    process.env.CLAUDE_PROJECT_DIR = e;
+    await runWithStdin(JSON.stringify(footer), () => main('tool-savings'));
+    assert.equal(readSession(e, 's1').savedTokens, 2181);
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
 test('tool-savings sums the [graft] footer into the session total, keyed by session_id', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-savings-'));
+  const d = indexedDir('graft-savings-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     // A graft tool result the agent just read (shape mirrors a Bash tool_response).
@@ -515,7 +544,7 @@ test('tool-savings sums the [graft] footer into the session total, keyed by sess
 });
 
 test('tool-savings sums every footer when one payload carries several', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-savings-'));
+  const d = indexedDir('graft-savings-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     const stdin = JSON.stringify({
@@ -534,7 +563,7 @@ test('tool-savings sums every footer when one payload carries several', async ()
 });
 
 test('tool-savings is a no-op (no session file) when the tool output has no graft footer', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-savings-'));
+  const d = indexedDir('graft-savings-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     const stdin = JSON.stringify({
@@ -550,7 +579,7 @@ test('tool-savings is a no-op (no session file) when the tool output has no graf
 });
 
 test('tool-savings counts a REAL savings line (with the turn nudge) exactly once', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-savings-real-'));
+  const d = indexedDir('graft-savings-real-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     // body ≈ 10 tok, baseline ≈ 2000 tok → footer claims ≈ 1990 saved. The nudge
@@ -567,7 +596,7 @@ test('tool-savings counts a REAL savings line (with the turn nudge) exactly once
 // ── the usage-mix counters: graft vs source (both hosts) ───────────────────
 
 test('tool-savings now scores the mix: a Read is a source read, a graft footer is a graft read', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-mix-'));
+  const d = indexedDir('graft-mix-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     await runWithStdin(JSON.stringify({ session_id: 'm', tool_name: 'Read', tool_input: { file_path: '/x' } }), () => main('tool-savings'));
@@ -588,7 +617,7 @@ test('tool-savings now scores the mix: a Read is a source read, a graft footer i
 // ── Cursor hook adapters ────────────────────────────────────────────────────
 
 test('cursor-post-tool: Read → source read, Shell graft → graft read + savings, keyed by conversation_id', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-pt-'));
+  const d = indexedDir('graft-cursor-pt-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     await runWithStdin(JSON.stringify({ conversation_id: 'c1', tool_name: 'Read', tool_input: {} }), () => main('cursor-post-tool'));
@@ -622,7 +651,7 @@ test('cursor-post-tool skips graft MCP tools — prefixed AND bare — so afterM
 });
 
 test('cursor-mcp: a graft MCP tool is a graft read with savings from result_json; a foreign MCP tool is a no-op', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-mcp-'));
+  const d = indexedDir('graft-cursor-mcp-');
   process.env.CLAUDE_PROJECT_DIR = d;
   try {
     await runWithStdin(JSON.stringify({
@@ -640,7 +669,7 @@ test('cursor-mcp: a graft MCP tool is a graft read with savings from result_json
 });
 
 test('cursor-session-end force-closes THIS conversation even though its file was just touched (idle gate skipped)', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-end-'));
+  const d = indexedDir('graft-cursor-end-');
   const home = mkdtempSync(join(tmpdir(), 'graft-cursor-end-home-'));
   mkdirSync(join(d, 'graft', '.cache', 'session'), { recursive: true });
   const sfile = join(d, 'graft', '.cache', 'session', 'c1.json');
