@@ -177,7 +177,35 @@ export function mergeGraftHooks(existing: Json, helpers: string): { merged: Json
   for (const [event, blocks] of Object.entries(graftBlocks(helpers))) {
     const prior = Array.isArray(merged.hooks[event]) ? merged.hooks[event] : [];
     const foreign = prior.filter((e: Json) => !isGraftEntry(e));
-    merged.hooks[event] = [...foreign, ...blocks];
+    const wanted = blocks.filter((b) => !foreign.some((e: Json) => wrapsGraftHook(e, hookArg(b))));
+    merged.hooks[event] = [...foreign, ...wanted];
   }
   return { merged };
+}
+
+/** The graft event a block runs: the last word of its command (`prompt`, `post-edit`, …). */
+function hookArg(block: Json): string {
+  const cmd: string = block?.hooks?.[0]?.command ?? '';
+  return cmd.split(/\s+/).pop() ?? '';
+}
+
+/**
+ * Is this foreign entry a user's wrapper around graft's hook for `arg`?
+ *
+ * Some installs call graft's hooks through their own script, for example a gate
+ * that runs `graft-hooks.cjs` only where a graph exists and logs how long it took
+ * (`~/.claude/helpers/graft-hooks-gate.sh prompt`). That command does not contain
+ * `graft-hooks.cjs`, so {@link isGraftEntry} calls it foreign, keeps it, and adds
+ * graft's own block beside it: every hook then ran twice, and the second copy
+ * skipped the user's gate. A wrapper is recognised by a `graft-hooks…` script name
+ * followed by the same event argument, and its event is left to it.
+ */
+export function wrapsGraftHook(entry: unknown, arg: string): boolean {
+  if (!arg) return false;
+  const hooks: unknown[] = Array.isArray((entry as Json)?.hooks) ? (entry as Json).hooks : [];
+  return hooks.some((h) => {
+    const cmd = (h as Json)?.command;
+    if (typeof cmd !== 'string' || cmd.includes('graft-hooks.cjs')) return false;
+    return new RegExp(`graft-hooks[\\w.-]*"?\\s+${arg}(\\s|$)`).test(cmd);
+  });
 }

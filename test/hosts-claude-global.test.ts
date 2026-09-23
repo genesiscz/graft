@@ -137,6 +137,35 @@ test('an existing settings.json keeps every key graft does not own', () => {
   assert.equal(s.permissions, undefined, 'no global allowlist');
 });
 
+test("a user's wrapper around graft's hook keeps its event; graft adds no second copy", () => {
+  // Observed on a real machine: a gate script calling graft-hooks.cjs only where a
+  // graph exists. isGraftEntry did not recognise it, so every init added graft's own
+  // ungated block beside it and each hook ran twice.
+  const home = tmpRepo('cgwrap');
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  const gate = (arg: string) => ({ hooks: [{ type: 'command', command: `"${home}/.claude/helpers/graft-hooks-gate.sh" ${arg}`, timeout: 8 }] });
+  writeFileSync(settingsOf(home), JSON.stringify({
+    hooks: {
+      PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', ...gate('post-edit') }, { matcher: 'Bash|Read', ...gate('tool-savings') }],
+      UserPromptSubmit: [gate('prompt')],
+      Stop: [gate('stop')],
+    },
+  }, null, 2));
+
+  installClaudeGlobal(home);
+  installClaudeGlobal(home);
+
+  const s = readJson(settingsOf(home));
+  const cmds = (event: string): string[] => s.hooks[event].flatMap((e: any) => e.hooks.map((h: any) => h.command));
+  assert.deepEqual(cmds('UserPromptSubmit').length, 1, 'the wrapper alone');
+  assert.deepEqual(cmds('Stop').length, 1);
+  assert.equal(cmds('PostToolUse').length, 2);
+  assert.ok(cmds('PostToolUse').every((c) => c.includes('graft-hooks-gate.sh')));
+  // Negative control: the one event nothing wraps still gets graft's own entry.
+  assert.equal(cmds('SessionStart').length, 1);
+  assert.match(cmds('SessionStart')[0], /graft-hooks\.cjs" session-start/);
+});
+
 test('an existing user-scope MCP server survives, and re-running converges', () => {
   const home = tmpRepo('cgmcp');
   writeFileSync(userMcpOf(home), JSON.stringify({ mcpServers: { paper: { command: 'paper' } } }, null, 2));
