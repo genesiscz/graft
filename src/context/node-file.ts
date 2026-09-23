@@ -26,6 +26,7 @@ import { join } from "node:path";
 import matter from "gray-matter";
 import { contentHash, normalizeName } from "../util/id.js";
 import { relPosix, stripTrailingSlashes } from "../util/paths.js";
+import { ensureIgnored, ignoreMode } from "../util/ignore.js";
 // Value-only import of a constant; `write.ts` pulls in nothing from here, so no cycle.
 import { GRAPH_DIR } from "../graph/write.js";
 
@@ -127,28 +128,14 @@ const GRAPH_CACHE_NOTE = "graft's local graph cache — regenerable, not committ
 export const LINK_NOTE = "graft's brain link — holds a read token, never commit it.";
 
 export function ensureGitignored(root: string, contextDir: string, note = GRAPH_CACHE_NOTE): void {
-  if (envTruthy("GRAFT_NO_GITIGNORE")) return;
   const rel = relPosix(root, contextDir);
   if (rel === "" || rel.startsWith("..")) return; // dir is at/above the repo root — nothing sane to ignore
-  const bare = stripTrailingSlashes(rel); // "graft" (or a `--dir` subpath like "tools/ctx")
-  // Root-ANCHORED, so it ignores exactly this repo's `graft/` and not a directory named
-  // `graft` at any depth. An unanchored `graft/` also matched `.claude/skills/graft/`, so
-  // committing the skill graft just wrote was silently dropped (#79). `rel` is always
-  // repo-relative here, so a leading `/` is always safe (incl. a `--dir` subpath).
-  const entry = `/${bare}/`;
-  const path = join(root, ".gitignore");
-  let current = "";
-  try { current = readFileSync(path, "utf8"); } catch { /* no .gitignore yet — we create one */ }
-  // Accept the anchored form AND the older unanchored `graft/` / `graft`, so existing
-  // repos aren't double-appended and a hand-anchored entry survives the next build.
-  const present = current.split("\n").some((l) => {
-    const t = l.trim();
-    return t === entry || t === `${bare}/` || t === bare;
-  });
-  if (present) return;
-  const gap = current === "" ? "" : current.endsWith("\n") ? "\n" : "\n\n";
-  const block = `${gap}# ${note}\n${entry}\n`;
-  try { writeFileSync(path, current + block); } catch { /* best-effort — build already succeeded */ }
+  // Root-ANCHORED (`/graft/`), so it ignores exactly this repo's `graft/` and not a
+  // directory named `graft` at any depth. An unanchored `graft/` also matched
+  // `.claude/skills/graft/`, so committing the skill graft just wrote was silently
+  // dropped (#79). The older unanchored forms still count as present. Which file the
+  // line goes to (`.gitignore`, `.git/info/exclude`, or none) is util/ignore.ts's call.
+  ensureIgnored(root, stripTrailingSlashes(rel), { note, dir: true });
 }
 
 /**
@@ -182,6 +169,9 @@ export function ensureSearchable(root: string, contextDir: string): void {
   try { current = readFileSync(path, "utf8"); } catch { /* no .ignore yet — we create one */ }
   // Any mention of the negation means a human (or a previous build) has already
   // had an opinion here; leave it alone rather than append a second copy.
+  // In exclude mode nothing graft writes may show up in `git status`, and that
+  // includes this file.
+  if (ignoreMode(root) === "exclude") ensureIgnored(root, ".ignore", { note: "graft's search re-admission file — local, not committed." });
   if (current.split("\n").some((l) => l.trim() === entry)) return;
   const gap = current === "" ? "" : current.endsWith("\n") ? "\n" : "\n\n";
   const block =

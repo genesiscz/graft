@@ -247,6 +247,9 @@ export interface WiringOpts {
   hooks: boolean;
   /** false → skip Claude Code statusLine (`--no-statusline` / GRAFT_NO_STATUSLINE). */
   statusline: boolean;
+  /** Where Claude Code's wiring lives (`--layout`, claude/init.ts). Absent in a
+   * stamp written before layouts existed, which was always `repo`. */
+  layout?: 'repo' | 'global';
 }
 
 export const DEFAULT_WIRING_OPTS: WiringOpts = { global: true, mcp: true, hooks: true, statusline: true };

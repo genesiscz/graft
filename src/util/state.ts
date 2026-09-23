@@ -11,6 +11,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
+import { ensureIgnored } from './ignore.js';
 
 export interface Stats {
   nodeCount: number; edgeCount: number; languages: string[];
@@ -107,6 +108,9 @@ export interface BuildConfig {
    * `~/.graft/`, because a brain belongs to one repository and two checkouts on
    * one machine must not share one. `undefined` clears it. */
   brain?: { brainId: string; token: string; baseUrl?: string };
+  /** Where graft records "do not commit" for what it writes here: `.gitignore`,
+   * `.git/info/exclude`, or nowhere (util/ignore.ts). Set by `graft init --ignore`. */
+  ignore?: 'gitignore' | 'exclude' | 'none';
 }
 
 /** Local, Git-ignored repository configuration. Kept outside generated
@@ -119,23 +123,15 @@ export function buildConfigPath(d: string): string { return join(d, BUILD_CONFIG
 /** Keep local build configuration out of Git without coupling it to the
  * generated graph directory. Best-effort, matching graph-cache ignore setup. */
 function ensureBuildConfigIgnored(d: string): void {
-  const path = join(d, '.gitignore');
-  let current = '';
-  try { current = readFileSync(path, 'utf8'); } catch { /* no .gitignore yet */ }
-  const present = current.split('\n').some((line) => {
-    const value = line.trim();
-    return value === BUILD_CONFIG_DIR || value === `${BUILD_CONFIG_DIR}/` || value === `/${BUILD_CONFIG_DIR}/`;
-  });
-  if (present) return;
-  const gap = current === '' ? '' : current.endsWith('\n') ? '\n' : '\n\n';
-  const block = `${gap}# graft's local repository settings — not committed.\n/${BUILD_CONFIG_DIR}/\n`;
-  try { writeFileSync(path, current + block); } catch { /* best-effort */ }
+  ensureIgnored(d, BUILD_CONFIG_DIR, { note: "graft's local repository settings — not committed.", dir: true, secret: true });
 }
 
 export function readBuildConfig(d: string): BuildConfig | null { return readJson<BuildConfig>(buildConfigPath(d)); }
 export function writeBuildConfig(d: string, c: BuildConfig): void {
-  ensureBuildConfigIgnored(d);
+  // Written first: the ignore step reads the mode from this very file, so the run
+  // that sets `ignore: 'exclude'` must not still record `.graft/` in `.gitignore`.
   writeJsonAtomic(buildConfigPath(d), c);
+  ensureBuildConfigIgnored(d);
 }
 
 /** Merge explicit CLI choices into the existing local config, so updating one

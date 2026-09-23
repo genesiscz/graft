@@ -3,13 +3,30 @@
 // installed graft). This is the single source of truth for the skill text; graft's own
 // repo copy is regenerated from here when `init` runs in this repo. Mirrors the `.cjs`
 // shim pattern in shim-template.ts.
-export function skillTemplate(): string {
-  return `---
-name: graft
-description: This repo is indexed by graft/. For ANY task here, whether
+/** Marks a user-level skill file as graft's to rewrite. A user-level skill without
+ *  it is the user's own copy, and `graft init --layout global` never touches it. */
+export const USER_SKILL_MARKER = '<!-- graft:user-skill -->';
+
+/**
+ * `userLevel`: the copy for `~/.claude/skills/graft/SKILL.md`, which loads in every
+ * project. Its description says to use graft only where a `graft/` exists, because at
+ * user level "this repo is indexed" is false in most of the places it loads.
+ */
+export function skillTemplate(opts: { userLevel?: boolean } = {}): string {
+  const description = opts.userLevel
+    ? `description: Use in any repo that has a graft/ directory at its root. For
+  ANY task there, whether understanding how something works, finding where code
+  lives, tracing what calls a symbol or what a change breaks, or scoping an edit,
+  get your context from graft before grepping or reading source files. A repo with
+  no graft/ is not indexed; do not run graft commands in one.`
+    : `description: This repo is indexed by graft/. For ANY task here, whether
   understanding how something works, finding where code lives, tracing what
   calls a symbol or what a change breaks, or scoping an edit, get your context
-  from graft before grepping or reading source files.
+  from graft before grepping or reading source files.`;
+  const marker = opts.userLevel ? `\n${USER_SKILL_MARKER}\n` : '';
+  return `---
+name: graft
+${description}
 ---
 
 # graft
@@ -160,5 +177,5 @@ When the graft MCP server is connected, these are exposed as tools too:
 \`graft_find_code\`, \`graft_find_all\`, \`graft_file_api\`, \`graft_trace_calls\` (with
 \`direction\` / \`depth\`), \`graft_repo_map\`, \`graft_check_freshness\`. Use whichever surface is
 available; the guidance is identical.
-`;
+${marker}`;
 }

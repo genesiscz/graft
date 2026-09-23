@@ -288,6 +288,8 @@ With no TTY to prompt on — CI, a Dockerfile, a piped shell — `init` writes *
 | `--no-hooks` | skip hook installation |
 | `--no-statusline` | skip writing Claude Code `statusLine` (same as `GRAFT_NO_STATUSLINE=1`) |
 | `--no-global` | skip writes outside this repo (the `~/.codex/` entries below) |
+| `--layout repo\|global` | where Claude Code's wiring lives. `repo` (default): settings, shims, skill and `.mcp.json` in the repo. `global`: hooks, MCP server and skill in `~/.claude` only; the repo gets nothing but `graft/`, and the hooks do nothing in a project without a graph |
+| `--ignore gitignore\|exclude\|none` | where graft records what not to commit. `gitignore` (default) edits `.gitignore`; `exclude` uses `.git/info/exclude`, so nothing graft writes is a change to commit; `none` leaves it to you. Remembered in `.graft/config.json` for later builds; `GRAFT_IGNORE` overrides it per process |
 
 #### Writes outside the repo
 
@@ -400,6 +402,7 @@ graft init --yes                     # no prompt; wire every detected agent
 graft init --no-global               # skip writes outside this repo (~/.codex/ config + hooks)
 graft init --no-statusline           # skip Claude Code statusLine (same as GRAFT_NO_STATUSLINE=1)
 graft init --no-build                # wire the files only; don't build the graph
+graft init --layout global --ignore exclude   # hooks + MCP + skill in ~/.claude only; nothing in the repo to commit
 graft init --all-agents              # wire every known agent, detected or not
 graft init --list-agents             # list known agent ids and exit
 

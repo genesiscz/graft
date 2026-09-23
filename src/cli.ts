@@ -13,7 +13,7 @@ import { resolveConfig, type EngineConfig } from "./ai/providers.js";
 import type { ProviderKind } from "./ai/llm/factory.js";
 import { formatCheckReport } from "./context/check.js";
 import { formatGraphCheckReport } from "./graph/check.js";
-import { buildGraphIfMissing, runInit } from "./claude/init.js";
+import { buildGraphIfMissing, INIT_LAYOUTS, runInit, type InitLayout } from "./claude/init.js";
 import { statuslineWanted } from "./claude/settings-merge.js";
 import { runHostsInit } from "./hosts/init.js";
 import { hostIds } from "./hosts/registry.js";
@@ -24,7 +24,7 @@ import { buildLocalDigest, fetchExpectedRepo, pushDigest, repoSlugFromGit, sameR
 import { readLink, writeLink } from "./brain/link.js";
 import { watchBuild } from "./brain/watch.js";
 import { openBrowser, signupUrl, startHandoff } from "./brain/signup.js";
-import { contextDirFor } from "./context/node-file.js";
+import { contextDirFor, ensureGitignored } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "./graph/refresh.js";
 import { isWorkspaceBuildRoot, readWorkspace } from "./graph/workspace.js";
@@ -48,6 +48,7 @@ import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurren
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
 import { isHomeDir } from "./util/home.js";
+import { IGNORE_MODES, isIgnoreMode } from "./util/ignore.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { setInputRate } from "./context/savings.js";
 import { maybeRefreshInBackground, refreshUpdateCache, takeUpdateNotice, writeStamp } from "./upkeep.js";
@@ -950,7 +951,17 @@ program
   .option("-y, --yes", "skip the picker and wire every detected agent (the pre-0.8 default)")
   .option("--no-global", "skip writes outside this repo (the ~/.codex/ config + hooks)")
   .option("--brain <handoff>", "attach a Trail brain: <brainId>:<token> (or a bare brain id with GRAFT_BRAIN_TOKEN set)")
-  .action(async (dir: string, opts: { build?: boolean; agents?: string[]; allAgents?: boolean; listAgents?: boolean; mcp?: boolean; hooks?: boolean; statusline?: boolean; dryRun?: boolean; yes?: boolean; global?: boolean; brain?: string }) => {
+  .option("--layout <layout>", "where Claude Code's wiring lives: repo (files in the repo, the default) or global (hooks, MCP and skill in ~/.claude only; the repo gets just graft/)")
+  .option("--ignore <mode>", "where graft records what not to commit: gitignore (default), exclude (.git/info/exclude, nothing to commit) or none; remembered for later builds")
+  .action(async (dir: string, opts: { build?: boolean; agents?: string[]; allAgents?: boolean; listAgents?: boolean; mcp?: boolean; hooks?: boolean; statusline?: boolean; dryRun?: boolean; yes?: boolean; global?: boolean; brain?: string; layout?: string; ignore?: string }) => {
+    if (opts.layout !== undefined && !INIT_LAYOUTS.includes(opts.layout as InitLayout)) {
+      console.error(`✗ --layout takes ${INIT_LAYOUTS.join(" or ")} — got "${opts.layout}"`);
+      process.exit(1);
+    }
+    if (opts.ignore !== undefined && !isIgnoreMode(opts.ignore)) {
+      console.error(`✗ --ignore takes ${IGNORE_MODES.join(", ")} — got "${opts.ignore}"`);
+      process.exit(1);
+    }
     if (opts.listAgents) {
       for (const id of [...hostIds(), "claude"]) console.log(id);
       return;
@@ -1100,11 +1111,17 @@ function wireTarget(
     cliPath: string;
     plan: ReturnType<typeof planInit>;
     wantClaude: boolean;
-    opts: { build?: boolean; mcp?: boolean; hooks?: boolean; global?: boolean; statusline?: boolean };
+    opts: { build?: boolean; mcp?: boolean; hooks?: boolean; global?: boolean; statusline?: boolean; layout?: string; ignore?: string };
   },
 ): void {
     const { home, cliPath, plan, wantClaude, opts } = ctx;
-    const wantStatusline = statuslineWanted({ statusline: opts.statusline });
+    const layout: InitLayout = opts.layout === "global" ? "global" : "repo";
+    // The global layout never writes a statusline: a session has one, and a global one
+    // would outrank the user's own. So a replay must not record one either.
+    const wantStatusline = layout === "repo" && statuslineWanted({ statusline: opts.statusline });
+    // Persisted before anything is written, so this run's own ignore lines already
+    // honor it, and every later build does too.
+    if (isIgnoreMode(opts.ignore)) patchBuildConfig(repo, { ignore: opts.ignore });
 
     // Converge, don't just add. init writes the selected hosts; without this it
     // never touches the rest, so a repo wired by an older version (or by the same
@@ -1121,7 +1138,18 @@ function wireTarget(
       // `global`/`home` are threaded through alongside `statusline`: the claude layer
       // writes under `~/.claude` now (hosts/claude-global.ts), so --no-global has to
       // reach it or the flag would silently mean "no out-of-repo writes, except three".
-      const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home });
+      const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home, layout });
+      if (res.layout === "global") {
+        for (const g of res.global) console.error(`✓ ${g.id}: ${g.path} (${g.action})`);
+        console.error(
+          res.skillAction === "kept-user-copy"
+            ? `· kept your own ${res.skill} (it has no graft marker, so graft leaves it alone)`
+            : `✓ skill: ${res.skill} (${res.skillAction})`,
+        );
+        console.error(res.built ? "✓ built the graph (graft build)" : "· skipped graph build");
+        console.error("· layout global: nothing written into the repo but graft/. Hooks run only where a graph exists.");
+        console.error("· no statusline in the global layout; to show graft's bar, point statusLine at a script that runs graft-statusline.cjs");
+      } else {
       console.error(`✓ wrote ${res.settingsPath}`);
       for (const s of res.shims) console.error(`✓ wrote ${s}`);
       console.error(`✓ wrote ${res.skill}`);
@@ -1134,6 +1162,7 @@ function wireTarget(
       console.error(res.built ? "✓ built the graph (graft build)" : "· skipped graph build");
       if (!wantStatusline) console.error("· skipped Claude Code statusLine (--no-statusline)");
       for (const w of res.warnings) console.error(`⚠ ${w}`);
+      }
     }
 
     // `ids` is already resolved, so hosts init is always driven by an explicit
@@ -1165,7 +1194,11 @@ function wireTarget(
       mcp: opts.mcp !== false,
       hooks: opts.hooks !== false,
       statusline: wantStatusline,
+      layout,
     });
+    // The stamp lives in graft/, so graft/ exists now even under --no-build, when no
+    // build would have recorded it as not-to-commit.
+    ensureGitignored(repo, contextDirFor(repo));
 
     // Every host's wiring points at graft/, so the graph is built whatever was
     // selected — not only when Claude Code is in the list (runInit does its own).
