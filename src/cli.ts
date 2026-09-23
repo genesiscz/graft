@@ -50,7 +50,7 @@ import { normalizePathPrefix } from "./util/paths.js";
 import { isHomeDir } from "./util/home.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { setInputRate } from "./context/savings.js";
-import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
+import { maybeRefreshInBackground, refreshUpdateCache, takeUpdateNotice, writeStamp } from "./upkeep.js";
 import {
   errorCode,
   filesBucket,
@@ -221,7 +221,7 @@ const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "_brain-refr
 program.hook("preAction", (_parent, action) => {
   if (UPKEEP_SKIP.has(action.name())) return;
   maybeRefreshInBackground();
-  const nudge = formatUpdateNudge(currentVersion, readUpdateCache()?.latest);
+  const nudge = takeUpdateNotice(currentVersion, { isTTY: process.stderr.isTTY === true });
   if (nudge) console.error(nudge);
   // Telemetry, in the order a user should experience it: disclose first, then
   // record, then (at most once a day, detached) send. Every step is a no-op in a

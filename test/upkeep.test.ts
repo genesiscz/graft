@@ -14,6 +14,9 @@ import {
   reconcileWiring,
   runningVersion,
   stampPath,
+  takeUpdateNotice,
+  UPDATE_NOTICE_INTERVAL_MS,
+  updateBadge,
   updateCachePath,
   wiredHostIds,
   wiringOpts,
@@ -134,6 +137,32 @@ test('by default a refresh DOES reach ~/.codex — nothing else ever would', () 
   });
   assert.deepEqual(seen, DEFAULT_WIRING_OPTS);
   assert.equal(r?.global, true);
+});
+
+test('takeUpdateNotice: only on a terminal, only when newer, at most once per interval', () => {
+  const home = tmpRepo('upkeep-notice');
+  mkdirSync(join(home, '.graft'), { recursive: true });
+  writeFileSync(updateCachePath(home), JSON.stringify({ latest: '99.0.0', checkedAt: Date.now() }));
+  const env = {};
+  const now = 1_800_000_000_000;
+
+  assert.equal(takeUpdateNotice('1.0.0', { isTTY: false, env, home, now }), null, 'an agent shell never sees it');
+  assert.equal(takeUpdateNotice('1.0.0', { isTTY: true, env: { GRAFT_NO_UPDATE_NOTICE: '1' }, home, now }), null);
+  assert.equal(takeUpdateNotice('99.0.0', { isTTY: true, env, home, now }), null, 'up to date');
+
+  assert.match(takeUpdateNotice('1.0.0', { isTTY: true, env, home, now }) ?? '', /99\.0\.0 available/);
+  assert.equal(takeUpdateNotice('1.0.0', { isTTY: true, env, home, now: now + 60_000 }), null, 'once, not per command');
+  assert.match(
+    takeUpdateNotice('1.0.0', { isTTY: true, env, home, now: now + UPDATE_NOTICE_INTERVAL_MS }) ?? '',
+    /available/,
+    'and again after the interval',
+  );
+});
+
+test('updateBadge is the short statusline form', () => {
+  assert.equal(updateBadge('1.0.0', '1.1.0'), '⬆ graft 1.1.0');
+  assert.equal(updateBadge('1.1.0', '1.1.0'), null);
+  assert.equal(updateBadge('1.1.0', null), null);
 });
 
 test('a refresh never treats the home directory as a repo', () => {

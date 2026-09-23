@@ -9,11 +9,9 @@ import { runInit } from './claude/init.js';
 import { runHostsInit } from './hosts/init.js';
 import { graftCliPath } from './claude/paths.js';
 import {
-  formatUpdateNudge,
   formatWiringRefresh,
   maybeRefreshBrainRules,
   maybeRefreshInBackground,
-  readUpdateCache,
   reconcileWiring,
   type WiringOpts,
 } from './upkeep.js';
@@ -73,9 +71,12 @@ export function runUpkeep(
     if (opts.background !== false) maybeRefreshBrainRules(repo);
   } catch { /* same */ }
   try {
+    // The registry answer is still kept fresh from here, but the upgrade line is no
+    // longer returned: these lines go into the agent's session-start context and the
+    // MCP instructions, where an agent that cannot upgrade anything paid for them on
+    // every session. The statusline and an interactive CLI carry it (upkeep.ts,
+    // updateBadge / takeUpdateNotice).
     if (opts.background !== false) maybeRefreshInBackground(opts.home);
-    const nudge = formatUpdateNudge(current, readUpdateCache(opts.home)?.latest);
-    if (nudge) lines.push(nudge);
   } catch { /* same */ }
   return { lines };
 }

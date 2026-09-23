@@ -187,6 +187,43 @@ export function formatUpdateNudge(current: string, latest: string | null | undef
   return `⬆ graft ${current} → ${latest} available: run \`npm i -g @nanonets/graft@latest\` (restart your agent after).`;
 }
 
+/** The statusline's short form of the same fact: `⬆ graft 0.20.0`, or null. */
+export function updateBadge(current: string, latest: string | null | undefined): string | null {
+  return isNewer(latest, current) ? `⬆ graft ${latest}` : null;
+}
+
+/** How often the CLI may repeat the upgrade line. The statusline shows it all the time. */
+export const UPDATE_NOTICE_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+function noticeStampPath(home: string = homedir()): string {
+  return join(home, '.graft', 'update-notice.json');
+}
+
+/**
+ * The CLI's upgrade line, rate-limited, or null.
+ *
+ * It used to print on every command. An agent runs graft dozens of times a turn
+ * through a non-interactive shell, so the line landed in every tool result and in
+ * every session-start context: tokens spent on a fact the agent cannot act on. Now
+ * it prints only to a person at a terminal (stderr is a TTY), at most once per
+ * {@link UPDATE_NOTICE_INTERVAL_MS}, and never with `GRAFT_NO_UPDATE_NOTICE=1`.
+ * The statusline carries the persistent form ({@link updateBadge}).
+ */
+export function takeUpdateNotice(
+  current: string,
+  opts: { isTTY: boolean; env?: NodeJS.ProcessEnv; home?: string; now?: number },
+): string | null {
+  const env = opts.env ?? process.env;
+  if (!opts.isTTY || env.GRAFT_NO_UPDATE_NOTICE === '1') return null;
+  const line = formatUpdateNudge(current, readUpdateCache(opts.home)?.latest);
+  if (!line) return null;
+  const now = opts.now ?? Date.now();
+  const last = readJson<{ notifiedAt?: number }>(noticeStampPath(opts.home))?.notifiedAt;
+  if (typeof last === 'number' && now - last < UPDATE_NOTICE_INTERVAL_MS) return null;
+  try { writeJsonAtomic(noticeStampPath(opts.home), { notifiedAt: now }); } catch { /* unwritable home: say it anyway */ }
+  return line;
+}
+
 /* -------------------------------------------------------------------------- */
 /* the wiring stamp                                                           */
 /* -------------------------------------------------------------------------- */
