@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderStatusline, incomingEdges, formatBlastRadius, formatRetrieval, formatOrientation, renderSubagent, relevantRetrieval, INJECT_MIN_COVERAGE, NUDGE_CAP } from '../src/claude/format.js';
+import { ageLabel, renderStatusline, incomingEdges, formatBlastRadius, formatRetrieval, formatOrientation, renderSubagent, relevantRetrieval, INJECT_MIN_COVERAGE, NUDGE_CAP } from '../src/claude/format.js';
 import { emptyStats } from '../src/claude/state.js';
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -29,7 +29,7 @@ test('two-line bar: size + freshness + ctx + last', () => {
   assert.match(lines[0], /graft/);
   assert.match(lines[0], /319 nodes \/ 730 edges/);
   assert.doesNotMatch(lines[0], /enriched/); // enriched segment removed from the bar
-  assert.match(lines[0], /⚠ 4 stale/);
+  assert.match(lines[0], /⚠ 4 files changed since graph built/);
   assert.match(lines[1], /ctx 34%/);
   assert.match(lines[1], /last: pkce\.ts/);
 });
@@ -38,6 +38,35 @@ test('syncing overrides stale; synced when clean', () => {
   const base = { ...emptyStats(), nodeCount: 1, edgeCount: 0, totalCount: 1 };
   assert.match(strip(renderStatusline({ ...base, syncing: true, dirty: true }, null, { ctxPct: null })[0]), /syncing/);
   assert.match(strip(renderStatusline(base, null, { ctxPct: null })[0]), /✓ synced/);
+});
+
+test('the stale badge says how many files, how old the graph is, and when it catches up', () => {
+  const now = Date.parse('2026-09-23T12:00:00Z');
+  const base = { ...emptyStats(), nodeCount: 1, edgeCount: 0, totalCount: 1, syncedAt: '2026-09-23T11:46:00Z' };
+  const line = (s: object) => strip(renderStatusline({ ...base, ...s }, null, { ctxPct: null, now })[0]);
+
+  assert.match(line({ dirty: true, staleCount: 12 }), /⚠ 12 files changed since graph built 14m ago · syncs after this turn/);
+  assert.match(line({ dirty: true, staleCount: 1 }), /⚠ 1 file changed/);
+  // Dirty with no count: the probe could not read a fingerprint, so no number is invented.
+  assert.match(line({ dirty: true, staleCount: 0 }), /⚠ graph may be behind \(graph 14m old\)/);
+  assert.match(line({ syncing: true, dirty: true }), /syncing… \(graph 14m old\)/);
+  assert.match(line({}), /✓ synced 14m ago/);
+  assert.match(line({ dirty: true, staleCount: 3, syncedAt: null }), /⚠ 3 files changed since graph built · syncs/);
+});
+
+test('ageLabel picks the coarsest unit that is still honest', () => {
+  const now = Date.parse('2026-09-23T12:00:00Z');
+  assert.equal(ageLabel('2026-09-23T11:59:30Z', now), '30s');
+  assert.equal(ageLabel('2026-09-23T09:00:00Z', now), '3h');
+  assert.equal(ageLabel('2026-09-21T12:00:00Z', now), '2d');
+  assert.equal(ageLabel(null, now), null);
+  assert.equal(ageLabel('garbage', now), null);
+});
+
+test('the upgrade badge rides on the bar when given', () => {
+  const s = { ...emptyStats(), nodeCount: 1, edgeCount: 0, totalCount: 1 };
+  assert.match(strip(renderStatusline(s, null, { ctxPct: null, update: '⬆ graft 9.9.9' })[0]), /⬆ graft 9\.9\.9/);
+  assert.doesNotMatch(strip(renderStatusline(s, null, { ctxPct: null })[0]), /⬆/);
 });
 
 const wiring2 = {

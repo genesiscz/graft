@@ -15,23 +15,50 @@ const C = {
 };
 const SEP = C.muted(' · ');
 
-export function freshnessSegment(s: Stats): string {
-  if (s.syncing) return C.amber('syncing…');
-  if (s.dirty && s.staleCount > 0) return C.amber(`⚠ ${s.staleCount} stale`);
-  if (s.dirty) return C.amber('⚠ stale');
-  return C.indigo('✓ synced');
+/** `42s`, `14m`, `3h`, `2d`: how long ago an ISO timestamp was, or null when unknown. */
+export function ageLabel(iso: string | null, now: number = Date.now()): string | null {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(t)) return null;
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/**
+ * How far the graph is behind the working tree, in words a reader can act on.
+ * A bare "⚠ stale" said neither how bad nor what it meant: it is "files changed
+ * since the graph was built", queries still answer from the older graph, and the
+ * end-of-turn sync catches up. The count comes from the post-edit drift probe; a
+ * dirty flag with no count is a graph whose fingerprint the probe could not read,
+ * so the bar says the graph MAY be behind instead of inventing a number.
+ */
+export function freshnessSegment(s: Stats, now: number = Date.now()): string {
+  const age = ageLabel(s.syncedAt, now);
+  const built = age ? `graph ${age} old` : 'graph age unknown';
+  if (s.syncing) return C.amber(`syncing… (${built})`);
+  if (s.dirty && s.staleCount > 0) {
+    const files = s.staleCount === 1 ? '1 file' : `${s.staleCount} files`;
+    return C.amber(`⚠ ${files} changed since graph built${age ? ` ${age} ago` : ''} · syncs after this turn`);
+  }
+  if (s.dirty) return C.amber(`⚠ graph may be behind (${built}) · syncs after this turn`);
+  return C.indigo(age ? `✓ synced ${age} ago` : '✓ synced');
 }
 
 export function renderStatusline(
   stats: Stats | null,
   session: SessionState | null,
-  ctx: { ctxPct: number | null },
+  ctx: { ctxPct: number | null; now?: number; update?: string | null },
 ): string[] {
   if (!stats) {
     return [C.muted('◤ graft · not built · run ') + C.text('graft build')];
   }
   const top = [C.muted('◤ ') + C.indigo('graft'), C.text(`${stats.nodeCount} nodes / ${stats.edgeCount} edges`)];
-  top.push(freshnessSegment(stats));
+  top.push(freshnessSegment(stats, ctx.now));
+  // The upgrade notice lives here and not in hook output: the bar is read by the
+  // person who can run the upgrade, and costs the agent's context nothing.
+  if (ctx.update) top.push(C.muted(ctx.update));
   const saved = session?.savedTokens ?? 0;
   if (saved > 0) {
     // Dollars only once a turn has actually been billed — see context/price.ts.
