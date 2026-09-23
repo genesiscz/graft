@@ -99,6 +99,9 @@ async function runHook(event: string, stdin: object): Promise<void> {
 function repo(): string {
   const d = mkdtempSync(join(tmpdir(), 'graft-tally-repo-'));
   mkdirSync(join(d, 'graft', '.cache', 'session'), { recursive: true });
+  // A built graph: the Stop hook does nothing in a project without one.
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'), '{"meta":{"nodeCount":0,"edgeCount":0,"languages":[]},"nodes":[],"edges":[]}');
   process.env.CLAUDE_PROJECT_DIR = d;
   return d;
 }
