@@ -5,7 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { installClaudeGlobal, type GlobalWrite } from '../hosts/claude-global.js';
 import { mergeGraftSettings } from './settings-merge.js';
 import { statuslineShim, hooksShim } from './shim-template.js';
-import { skillTemplate } from './skill-template.js';
+import { skillTemplate, USER_SKILL_MARKER } from './skill-template.js';
+import { ensureIgnored, ignoreMode } from '../util/ignore.js';
 import { claudeDistDir } from './paths.js';
 import { mergeJsonKey, serverEntry, type McpWrite } from '../hosts/mcp-config.js';
 import { hasGraftIndex } from '../graph/root.js';
@@ -58,12 +59,75 @@ export interface InitResult {
   global: GlobalWrite[];
   warnings: string[];
   built: boolean;
+  layout: InitLayout;
+  /** Only in the global layout, where an existing user copy may be kept. */
+  skillAction?: ReturnType<typeof writeUserSkill>['action'];
 }
+
+/**
+ * Where Claude Code's wiring lives.
+ *
+ *   repo    upstream's default: `.claude/settings.json` (statusline + hooks), the two
+ *           shims, the skill and `.mcp.json` in the repo, plus the user-level floor
+ *           (hosts/claude-global.ts) unless `--no-global`.
+ *   global  only the user-level copy: hooks + shim in `~/.claude`, the MCP server in
+ *           `~/.claude.json`, the skill in `~/.claude/skills/graft/`. The repo gets
+ *           nothing but its `graft/` graph. The hooks fire in every project and do
+ *           nothing where there is no graph (claude/hooks.ts, hasGraph), so one
+ *           install serves every repo and every worktree, and no repo carries graft
+ *           files for anyone to commit or ignore. No statusline: a session has one,
+ *           and taking it globally would outrank the user's own.
+ */
+export type InitLayout = 'repo' | 'global';
+export const INIT_LAYOUTS: readonly InitLayout[] = ['repo', 'global'];
+
+/** `~/.claude/skills/graft/SKILL.md`, written only when absent or graft-owned. */
+export function writeUserSkill(home: string): { path: string; action: 'created' | 'updated' | 'unchanged' | 'kept-user-copy' } {
+  const path = join(home, '.claude', 'skills', 'graft', 'SKILL.md');
+  const want = skillTemplate({ userLevel: true });
+  let current: string | null = null;
+  try { current = readFileSync(path, 'utf8'); } catch { /* absent */ }
+  if (current === want) return { path, action: 'unchanged' };
+  // A copy without the marker is the user's own (edited, vendored, or older than the
+  // marker). It is theirs to maintain; rewriting it is what made a hand-tuned skill
+  // silently revert.
+  if (current !== null && !current.includes(USER_SKILL_MARKER)) return { path, action: 'kept-user-copy' };
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, want);
+  return { path, action: current === null ? 'created' : 'updated' };
+}
+
+/** The repo files the `repo` layout writes, as ignore patterns for `--ignore exclude`. */
+const REPO_LAYOUT_IGNORES: Array<{ rel: string; dir?: boolean }> = [
+  { rel: '.claude/settings.json' },
+  { rel: '.claude/helpers/graft-statusline.cjs' },
+  { rel: '.claude/helpers/graft-hooks.cjs' },
+  { rel: '.claude/skills/graft', dir: true },
+  { rel: '.mcp.json' },
+];
 
 export function runInit(
   dir: string,
-  opts: { build?: boolean; cliPath?: string; statusline?: boolean; global?: boolean; home?: string } = {},
+  opts: { build?: boolean; cliPath?: string; statusline?: boolean; global?: boolean; home?: string; layout?: InitLayout } = {},
 ): InitResult {
+  const home = opts.home ?? homedir();
+  if (opts.layout === 'global') {
+    const global = installClaudeGlobal(home);
+    const userSkill = writeUserSkill(home);
+    const built = buildGraphIfMissing(dir, opts);
+    return {
+      settingsPath: join(home, '.claude', 'settings.json'),
+      shims: [],
+      skill: userSkill.path,
+      skillAction: userSkill.action,
+      mcp: { id: 'claude', path: join(home, '.claude.json'), action: 'unchanged' },
+      global,
+      warnings: [],
+      built,
+      layout: 'global',
+    };
+  }
+
   // Same list `--dry-run` and the picker report, so the two can't drift apart.
   const [settings, statusline, hooks, skill, mcpTarget] = claudeTargets(dir).map((t) => t.path);
 
@@ -97,8 +161,13 @@ export function runInit(
   // hosts/claude-global.ts for the failure that motivates it. Gated on the same
   // flag `registerMcpConfigs` uses, so `--no-global` still means "nothing outside
   // this repo".
-  const global = opts.global === false ? [] : installClaudeGlobal(opts.home ?? homedir());
+  const global = opts.global === false ? [] : installClaudeGlobal(home);
+
+  // `--ignore exclude` promises nothing graft writes shows up in `git status`. In the
+  // other modes these files are the repo's wiring, meant to be committed.
+  if (ignoreMode(dir) === 'exclude')
+    for (const f of REPO_LAYOUT_IGNORES) ensureIgnored(dir, f.rel, { note: 'graft wiring — local to this clone.', dir: f.dir });
 
   const built = buildGraphIfMissing(dir, opts);
-  return { settingsPath, shims: [sl, hk], skill: skillPath, mcp, global, warnings, built };
+  return { settingsPath, shims: [sl, hk], skill: skillPath, mcp, global, warnings, built, layout: 'repo' };
 }

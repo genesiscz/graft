@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { isClean, probeDrift } from '../graph/fingerprint.js';
 import { readWiring, computeStats } from './stats.js';
-import { patchStats, releaseLock, resolveContextDir } from './state.js';
+import { acquireLock, patchStats, readStats, releaseLock, resolveContextDir } from './state.js';
 import { graftCliPath } from './paths.js';
 
 /** MONEY GUARD: plain `graft build` only — structural, $0, offline. Never --deep. */
@@ -16,8 +18,31 @@ function realBuild(dir: string): void {
   execFileSync(process.execPath, args, { cwd: dir, stdio: 'ignore', timeout: 120000 });
 }
 
+/**
+ * Is there anything to rebuild? `dirty` is the agent's own edits, set by the
+ * post-edit hook. The probe catches everything else — a branch switch, an editor
+ * save, a `git pull` — which sets no flag and used to be repaired only by a query's
+ * inline refresh. No hook refreshes inline any more (a rebuild has no place inside a
+ * budget of seconds), so this detached process is where that drift gets fixed. A
+ * missing fingerprint is a graph from before probes existed: build once, it lays one
+ * down.
+ */
+function needsBuild(dir: string): boolean {
+  if (readStats(dir)?.dirty) return true;
+  const drift = probeDrift(dir, resolveContextDir(dir));
+  return drift === null || !isClean(drift);
+}
+
 export function runSync(dir: string, build: (d: string) => void = realBuild): void {
+  // Never a repo's first build: that is the user's own `graft build`, opted into.
+  if (!existsSync(resolveContextDir(dir))) return;
+  // Under this process's pid, so a lock it leaves behind is reclaimed the moment it
+  // is gone (`acquireLockIn`). A refusal means another sync, or a query's refresh,
+  // holds it and will fix the same drift: nothing to wait for.
+  if (!acquireLock(dir)) return;
   try {
+    if (!needsBuild(dir)) return;
+    patchStats(dir, { syncing: true });
     build(dir);
     const w = readWiring(dir);
     if (!w) { patchStats(dir, { syncing: false }); return; } // build ran but output unreadable — stay dirty, retry

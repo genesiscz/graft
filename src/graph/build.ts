@@ -17,9 +17,10 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
+import { extractFile, languageLabelOf, languageOf, type Language, type RawEdge } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { parseInPool, poolEnabled, type ParseOutcome } from "./parse-pool.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
@@ -94,7 +95,11 @@ export interface GraphBuildOptions {
    * fingerprint so the freshness probe enumerates the same set. */
   onlyDirs?: string[];
   onProgress?: (info: {
-    phase: "parse" | "enrich";
+    /** `read` walks every file to hash it and decide replay-vs-parse; `parse` is the
+     * extraction that follows, which may run across worker threads (see parse-pool).
+     * They are reported separately because a single "parsing" counter that completes
+     * during the read pass would sit at N/N for the whole of the actual parse. */
+    phase: "read" | "parse" | "enrich";
     index: number;
     total: number;
     file: string;
@@ -146,6 +151,21 @@ function readGoModules(root: string, repoFiles: string[]): GoModule[] {
     }
   }
   return mods;
+}
+
+/** Depth-tier extraction with the failure recorded rather than thrown — the shape
+ * both the in-thread path and the pool's fallback need. */
+function extractOrError(
+  rel: string,
+  source: string,
+  lang: Language,
+): { nodes: NodeV1[]; rawEdges: RawEdge[] } | { error: string } {
+  try {
+    const { nodes, rawEdges } = extractFile(rel, source, lang);
+    return { nodes, rawEdges };
+  } catch (err) {
+    return { error: `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 export async function buildGraph(
@@ -202,9 +222,33 @@ export async function buildGraph(
     new Set(files.map((f) => containerLangOf(f.abs)?.name).filter((n): n is string => !!n)),
   );
 
+  // A file's outcome, decided during the first (always synchronous) pass below.
+  // Depth-tier files needing a parse start with `result: undefined`, filled in once
+  // the pool (or its serial fallback) resolves; every other outcome is complete the
+  // moment it is recorded. Storing one slot per file, by original index, is what
+  // lets the merge pass below reassemble `nodes`/`rawEdges` in exact file-walk order
+  // regardless of which files went through the pool — order matters downstream:
+  // `resolveEdges` breaks name-collision ties by array position (see graph/resolve.ts),
+  // so reordering nodes would silently change which of two same-named symbols a call
+  // resolves to. Splitting depth-tier work into a pool must never do that.
+  type FileOutcome =
+    | { kind: "read-error"; message: string }
+    | { kind: "unsupported-encoding" }
+    | { kind: "reuse"; source: string; label: string; cached: ExtractEntry }
+    | {
+        kind: "parsed";
+        source: string;
+        hash: string;
+        label: string;
+        result?: { nodes: NodeV1[]; rawEdges: RawEdge[] } | { error: string };
+      };
+
+  const outcomes: FileOutcome[] = new Array(files.length);
+  const depthJobs: { index: number; rel: string; source: string; lang: Language }[] = [];
+
   files.forEach((f, i) => {
     const rel = f.rel;
-    opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
+    opts.onProgress?.({ phase: "read", index: i, total: files.length, file: rel });
     // Depth tier (hand-written, native grammar) if a language claims the file;
     // otherwise the breadth tier (generic tags.scm over a WASM grammar).
     const lang = languageOf(f.abs);
@@ -230,52 +274,133 @@ export async function buildGraph(
       source = readSourceFile(f.abs);
     } catch (err) {
       const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
-      errors.push(message);
-      // Record it anyway (with the stat we do have) so the freshness probe's
-      // fast path doesn't report this file as new on every single query.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+      outcomes[i] = { kind: "read-error", message };
       return;
     }
     if (source === null) {
       // Unsupported encoding (UTF-16BE) — a skip, never an error: recorded with
       // an empty entry so the freshness probe doesn't treat it as new every run.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+      outcomes[i] = { kind: "unsupported-encoding" };
       return;
     }
 
     const hash = contentHash(source);
     if (cached && hash === cached.hash) {
-      entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
-      sources.set(rel, source);
-      reused++;
-      if (cached.error) {
-        errors.push(cached.error); // this file failed to parse last time too
-        return;
-      }
-      nodes.push(...cached.nodes);
-      rawEdges.push(...cached.rawEdges);
-      langs.add(label);
+      outcomes[i] = { kind: "reuse", source, label, cached };
       return;
     }
 
-    parsed++;
+    if (lang) {
+      // Depth tier: defer to the pool (or its serial fallback below), never parsed
+      // inline here — see the merge pass for why order still comes out identical.
+      depthJobs.push({ index: i, rel, source, lang });
+      outcomes[i] = { kind: "parsed", source, hash, label };
+      return;
+    }
+
+    // Breadth tier / container: parse inline immediately, exactly as before this
+    // pool existed. Neither goes through workers — the breadth tier's WASM grammars
+    // need the async warmup already done above, and containers are a small minority.
     try {
-      const { nodes: fileNodes, rawEdges: fileEdges } = lang
-        ? extractFile(rel, source, lang)
-        : container
-          ? extractContainer(rel, source, container)
-          : extractGeneric(rel, source, generic!.name);
-      nodes.push(...fileNodes);
-      rawEdges.push(...fileEdges);
-      sources.set(rel, source);
-      langs.add(label);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
+      const { nodes: fileNodes, rawEdges: fileEdges } = container
+        ? extractContainer(rel, source, container)
+        : extractGeneric(rel, source, generic!.name);
+      outcomes[i] = { kind: "parsed", source, hash, label, result: { nodes: fileNodes, rawEdges: fileEdges } };
     } catch (err) {
       const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
-      errors.push(message);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
+      outcomes[i] = { kind: "parsed", source, hash, label, result: { error: message } };
     }
   });
+
+  // Resolve every deferred depth-tier job. Below MIN_FILES_FOR_POOL, or with
+  // GRAFT_PARSE_WORKERS=0/1, this is the exact inline extractFile call it replaced —
+  // parseInPool never spawns a thread for a job poolEnabled() would refuse.
+  if (depthJobs.length > 0) {
+    let byIndex: Map<number, { nodes: NodeV1[]; rawEdges: RawEdge[] } | { error: string }>;
+    let done = 0;
+    const tick = (file: string, n = 1) => {
+      done += n;
+      opts.onProgress?.({ phase: "parse", index: done - 1, total: depthJobs.length, file });
+    };
+    if (poolEnabled(depthJobs.length)) {
+      const results = await parseInPool(
+        depthJobs.map((j) => ({ rel: j.rel, source: j.source, lang: j.lang })),
+        // One tick per worker batch, not per file: the workers report back in
+        // batches by design, and a caller watching a progress line needs to see
+        // that the pool is moving rather than a number frozen at the read total.
+        (chunk) => tick(chunk.lastFile, chunk.count),
+      );
+      const byRel = new Map<string, ParseOutcome>(results.map((r) => [r.rel, r]));
+      byIndex = new Map(
+        depthJobs.map((j): [number, { nodes: NodeV1[]; rawEdges: RawEdge[] } | { error: string }] => {
+          const r = byRel.get(j.rel);
+          // Never run (no worker, a crash, a missing reply): parse it here instead.
+          // The pool is an optimization, so anything it did not do falls back to the
+          // path that existed before it, and the graph comes out the same either way.
+          if (!r || r.unrun) return [j.index, extractOrError(j.rel, j.source, j.lang)];
+          if (r.error) return [j.index, { error: `${j.rel}: parse failed — ${r.error}` }];
+          return [j.index, { nodes: r.nodes!, rawEdges: r.rawEdges! }];
+        }),
+      );
+    } else {
+      byIndex = new Map(
+        depthJobs.map((j): [number, { nodes: NodeV1[]; rawEdges: RawEdge[] } | { error: string }] => {
+          tick(j.rel);
+          return [j.index, extractOrError(j.rel, j.source, j.lang)];
+        }),
+      );
+    }
+    for (const j of depthJobs) {
+      (outcomes[j.index] as Extract<FileOutcome, { kind: "parsed" }>).result = byIndex.get(j.index);
+    }
+  }
+
+  // Merge pass, in ORIGINAL FILE-WALK ORDER — identical order to the single loop
+  // this replaced, whatever mix of reuse/pool/inline produced each outcome.
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]!;
+    const rel = f.rel;
+    const o = outcomes[i]!;
+
+    if (o.kind === "read-error") {
+      errors.push(o.message);
+      // Record it anyway (with the stat we do have) so the freshness probe's
+      // fast path doesn't report this file as new on every single query.
+      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: o.message };
+      continue;
+    }
+    if (o.kind === "unsupported-encoding") {
+      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+      continue;
+    }
+    if (o.kind === "reuse") {
+      entries[rel] = { ...o.cached, size: f.size, mtimeMs: f.mtimeMs };
+      sources.set(rel, o.source);
+      reused++;
+      if (o.cached.error) {
+        errors.push(o.cached.error); // this file failed to parse last time too
+        continue;
+      }
+      nodes.push(...o.cached.nodes);
+      rawEdges.push(...o.cached.rawEdges);
+      langs.add(o.label);
+      continue;
+    }
+
+    // o.kind === "parsed"
+    parsed++;
+    const result = o.result!;
+    if ("error" in result) {
+      errors.push(result.error);
+      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: o.hash, nodes: [], rawEdges: [], error: result.error };
+      continue;
+    }
+    nodes.push(...result.nodes);
+    rawEdges.push(...result.rawEdges);
+    sources.set(rel, o.source);
+    langs.add(o.label);
+    entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: o.hash, nodes: result.nodes, rawEdges: result.rawEdges };
+  }
 
   // Persist the memo BEFORE enrichment, because `enrichGraph` mutates these very
   // node objects (summary/crux/summary_state) and the cache must only ever hold

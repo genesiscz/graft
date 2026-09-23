@@ -13,7 +13,7 @@ import { resolveConfig, type EngineConfig } from "./ai/providers.js";
 import type { ProviderKind } from "./ai/llm/factory.js";
 import { formatCheckReport } from "./context/check.js";
 import { formatGraphCheckReport } from "./graph/check.js";
-import { buildGraphIfMissing, runInit } from "./claude/init.js";
+import { buildGraphIfMissing, INIT_LAYOUTS, runInit, type InitLayout } from "./claude/init.js";
 import { statuslineWanted } from "./claude/settings-merge.js";
 import { runHostsInit } from "./hosts/init.js";
 import { hostIds } from "./hosts/registry.js";
@@ -22,8 +22,9 @@ import { rulesForPointers } from "./brain/attach.js";
 import { clearLink, type BrainLink } from "./brain/link.js";
 import { buildLocalDigest, fetchExpectedRepo, pushDigest, repoSlugFromGit, sameRepo } from "./brain/push.js";
 import { readLink, writeLink } from "./brain/link.js";
+import { watchBuild } from "./brain/watch.js";
 import { openBrowser, signupUrl, startHandoff } from "./brain/signup.js";
-import { contextDirFor } from "./context/node-file.js";
+import { contextDirFor, ensureGitignored } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "./graph/refresh.js";
 import { isWorkspaceBuildRoot, readWorkspace } from "./graph/workspace.js";
@@ -46,9 +47,11 @@ import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
+import { isHomeDir } from "./util/home.js";
+import { IGNORE_MODES, isIgnoreMode } from "./util/ignore.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { setInputRate } from "./context/savings.js";
-import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
+import { maybeRefreshInBackground, refreshUpdateCache, takeUpdateNotice, writeStamp } from "./upkeep.js";
 import {
   errorCode,
   filesBucket,
@@ -219,7 +222,7 @@ const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "_brain-refr
 program.hook("preAction", (_parent, action) => {
   if (UPKEEP_SKIP.has(action.name())) return;
   maybeRefreshInBackground();
-  const nudge = formatUpdateNudge(currentVersion, readUpdateCache()?.latest);
+  const nudge = takeUpdateNotice(currentVersion, { isTTY: process.stderr.isTTY === true });
   if (nudge) console.error(nudge);
   // Telemetry, in the order a user should experience it: disclose first, then
   // record, then (at most once a day, detached) send. Every step is a no-op in a
@@ -518,7 +521,7 @@ program
       onlyDirs,
       onProgress: ({ phase, index, total, file }) =>
         process.stderr.write(
-          `\r${phase === "enrich" ? "summarizing" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
+          `\r${phase === "enrich" ? "summarizing" : phase === "read" ? "reading" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
         ),
     }).catch((err: unknown) => {
       track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
@@ -948,7 +951,17 @@ program
   .option("-y, --yes", "skip the picker and wire every detected agent (the pre-0.8 default)")
   .option("--no-global", "skip writes outside this repo (the ~/.codex/ config + hooks)")
   .option("--brain <handoff>", "attach a Trail brain: <brainId>:<token> (or a bare brain id with GRAFT_BRAIN_TOKEN set)")
-  .action(async (dir: string, opts: { build?: boolean; agents?: string[]; allAgents?: boolean; listAgents?: boolean; mcp?: boolean; hooks?: boolean; statusline?: boolean; dryRun?: boolean; yes?: boolean; global?: boolean; brain?: string }) => {
+  .option("--layout <layout>", "where Claude Code's wiring lives: repo (files in the repo, the default) or global (hooks, MCP and skill in ~/.claude only; the repo gets just graft/)")
+  .option("--ignore <mode>", "where graft records what not to commit: gitignore (default), exclude (.git/info/exclude, nothing to commit) or none; remembered for later builds")
+  .action(async (dir: string, opts: { build?: boolean; agents?: string[]; allAgents?: boolean; listAgents?: boolean; mcp?: boolean; hooks?: boolean; statusline?: boolean; dryRun?: boolean; yes?: boolean; global?: boolean; brain?: string; layout?: string; ignore?: string }) => {
+    if (opts.layout !== undefined && !INIT_LAYOUTS.includes(opts.layout as InitLayout)) {
+      console.error(`✗ --layout takes ${INIT_LAYOUTS.join(" or ")} — got "${opts.layout}"`);
+      process.exit(1);
+    }
+    if (opts.ignore !== undefined && !isIgnoreMode(opts.ignore)) {
+      console.error(`✗ --ignore takes ${IGNORE_MODES.join(", ")} — got "${opts.ignore}"`);
+      process.exit(1);
+    }
     if (opts.listAgents) {
       for (const id of [...hostIds(), "claude"]) console.log(id);
       return;
@@ -966,6 +979,10 @@ program
       brainLink = parsed;
     }
     const repo = resolve(dir);
+    if (isHomeDir(repo)) {
+      console.error("✗ refusing to init your home directory: its .claude/ and .mcp.json are your user-level config, not a repo's. Run graft init inside a repository.");
+      process.exit(1);
+    }
     const explicit = Array.isArray(opts.agents) ? opts.agents : undefined;
 
     if (explicit) {
@@ -1094,11 +1111,17 @@ function wireTarget(
     cliPath: string;
     plan: ReturnType<typeof planInit>;
     wantClaude: boolean;
-    opts: { build?: boolean; mcp?: boolean; hooks?: boolean; global?: boolean; statusline?: boolean };
+    opts: { build?: boolean; mcp?: boolean; hooks?: boolean; global?: boolean; statusline?: boolean; layout?: string; ignore?: string };
   },
 ): void {
     const { home, cliPath, plan, wantClaude, opts } = ctx;
-    const wantStatusline = statuslineWanted({ statusline: opts.statusline });
+    const layout: InitLayout = opts.layout === "global" ? "global" : "repo";
+    // The global layout never writes a statusline: a session has one, and a global one
+    // would outrank the user's own. So a replay must not record one either.
+    const wantStatusline = layout === "repo" && statuslineWanted({ statusline: opts.statusline });
+    // Persisted before anything is written, so this run's own ignore lines already
+    // honor it, and every later build does too.
+    if (isIgnoreMode(opts.ignore)) patchBuildConfig(repo, { ignore: opts.ignore });
 
     // Converge, don't just add. init writes the selected hosts; without this it
     // never touches the rest, so a repo wired by an older version (or by the same
@@ -1115,7 +1138,18 @@ function wireTarget(
       // `global`/`home` are threaded through alongside `statusline`: the claude layer
       // writes under `~/.claude` now (hosts/claude-global.ts), so --no-global has to
       // reach it or the flag would silently mean "no out-of-repo writes, except three".
-      const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home });
+      const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home, layout });
+      if (res.layout === "global") {
+        for (const g of res.global) console.error(`✓ ${g.id}: ${g.path} (${g.action})`);
+        console.error(
+          res.skillAction === "kept-user-copy"
+            ? `· kept your own ${res.skill} (it has no graft marker, so graft leaves it alone)`
+            : `✓ skill: ${res.skill} (${res.skillAction})`,
+        );
+        console.error(res.built ? "✓ built the graph (graft build)" : "· skipped graph build");
+        console.error("· layout global: nothing written into the repo but graft/. Hooks run only where a graph exists.");
+        console.error("· no statusline in the global layout; to show graft's bar, point statusLine at a script that runs graft-statusline.cjs");
+      } else {
       console.error(`✓ wrote ${res.settingsPath}`);
       for (const s of res.shims) console.error(`✓ wrote ${s}`);
       console.error(`✓ wrote ${res.skill}`);
@@ -1128,6 +1162,7 @@ function wireTarget(
       console.error(res.built ? "✓ built the graph (graft build)" : "· skipped graph build");
       if (!wantStatusline) console.error("· skipped Claude Code statusLine (--no-statusline)");
       for (const w of res.warnings) console.error(`⚠ ${w}`);
+      }
     }
 
     // `ids` is already resolved, so hosts init is always driven by an explicit
@@ -1159,7 +1194,11 @@ function wireTarget(
       mcp: opts.mcp !== false,
       hooks: opts.hooks !== false,
       statusline: wantStatusline,
+      layout,
     });
+    // The stamp lives in graft/, so graft/ exists now even under --no-build, when no
+    // build would have recorded it as not-to-commit.
+    ensureGitignored(repo, contextDirFor(repo));
 
     // Every host's wiring points at graft/, so the graph is built whatever was
     // selected — not only when Claude Code is in the list (runInit does its own).
@@ -1251,6 +1290,13 @@ const brain = program
 async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | null> {
   const handoff = await startHandoff();
   const url = signupUrl({ repo: slug, port: handoff.port, state: handoff.state });
+  const startedAt = Date.now();
+
+  // Queued before the link is printed rather than after the outcome, because
+  // the outcome is the one thing a terminal handoff can lose: a user who reads
+  // the URL and walks away kills the process, and only an event already on disk
+  // survives that. This is the denominator; `brain_signup_settled` is not.
+  track("brain_signup_opened", {}, { repo });
 
   // Printed before the browser opens, and printed whether or not it opens: on a
   // remote shell nothing can open, and on a desktop the window sometimes lands
@@ -1262,6 +1308,10 @@ async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | n
   // minutes for a browser that will never come is worse than saying so now.
   if (!process.stderr.isTTY) {
     console.error("· not a terminal — open that link, then run `graft brain connect <brainId>:<token>` here");
+    // Its own outcome, not a timeout: nothing here could have opened a browser,
+    // so folding the two together would read as people abandoning signup when
+    // it is only a remote shell doing what it has to.
+    track("brain_signup_settled", { outcome: "no_tty", duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
     handoff.close();
     return null;
   }
@@ -1272,10 +1322,13 @@ async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | n
   const got = await handoff.wait();
   if ("error" in got) {
     console.error(`✗ ${got.error}`);
+    // The category, never the sentence: `got.error` names the repo and the link.
+    track("brain_signup_settled", { outcome: got.reason, duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
     return null;
   }
   writeLink(repo, got.link);
   console.error(`✓ brain connected to ${slug}`);
+  track("brain_signup_settled", { outcome: "linked", duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
   return got.link;
 }
 
@@ -1334,7 +1387,8 @@ brain
   .description("Read THIS repo on your machine and build its brain — no GitHub App, works on private repos")
   .argument("[dir]", "target repo directory", ".")
   .option("--no-approve", "leave the mined rules as drafts for review")
-  .action(async (dir: string, opts: { approve?: boolean }) => {
+  .option("--no-watch", "return as soon as the push is sent, without following the build")
+  .action(async (dir: string, opts: { approve?: boolean; watch?: boolean }) => {
     const repo = resolve(dir);
     // Resolved before the link, because an unlinked repo now signs up for a
     // brain and Trail creates that brain FOR a named repository. Without a slug
@@ -1396,8 +1450,48 @@ brain
     }
     const brainLabel = expected?.brainName ? `“${expected.brainName}”` : link.brainId;
     console.error(`✓ sent ${d.owner}/${d.name} to ${brainLabel}`);
-    console.error("· it is being mined into rules now — a few minutes. Watch it finish in your browser.");
-    console.error("  The rules reach this repo on their own; nothing else to run.");
+
+    // Held rather than handed back. Everything above this line succeeded even
+    // in the runs that end badly: the push lands, and then the miner fails —
+    // which is where roughly a third of production's repo brains die. Returning
+    // the prompt here is what made that invisible from this side, on CI and
+    // over SSH permanently so. `--no-watch` is for a caller that genuinely
+    // wants fire-and-forget, and it prints the old two lines instead.
+    if (opts.watch === false) {
+      console.error("· it is being mined into rules now — a few minutes. Watch it finish in your browser.");
+      console.error("  The rules reach this repo on their own; nothing else to run.");
+      return;
+    }
+
+    console.error("· building the brain — Ctrl-C detaches, it keeps going without you");
+    const outcome = await watchBuild(link);
+    if (outcome === "completed") {
+      console.error("✓ the brain is built — its rules reach this repo on their own; nothing else to run");
+      return;
+    }
+    // The ordinary ending for anything but a small repository. The history is
+    // mined in slices, and the prompt comes back on the first of them: mining is
+    // the part that fails and it has now succeeded, and the rest is filing,
+    // which is minutes of reliable work nobody gains by watching. The rules
+    // already in the brain are already being served.
+    if (outcome === "building") {
+      console.error("✓ the brain has its first rules — they reach this repo on their own; nothing else to run");
+      console.error("  The rest of the history is still being read. Watch it fill in your browser.");
+      return;
+    }
+    if (outcome === "failed") {
+      // A non-zero exit, unlike every other ending here: this is the one case
+      // where the work did not produce a brain, and a CI step that ran the push
+      // should hear about it the way it hears about any other failure.
+      console.error("  Nothing was lost — the brain is still there. Run `graft brain push` again to retry the read.");
+      process.exitCode = 1;
+      return;
+    }
+    if (outcome === "unreachable") {
+      console.error("· could not reach Trail to follow the build — it is still running. Watch it finish in your browser.");
+      return;
+    }
+    console.error("· still building after 15 minutes — it has not failed, it is just long. Watch it finish in your browser.");
   });
 
 brain

@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The Claude Code hooks no longer rebuild the graph inline.** The prompt hook's
+  `graft ask` asks `--no-refresh`, and the detached end-of-turn sync, which has no
+  seconds budget, owns every rebuild.
+  It now runs after every turn and probes for drift the agent did not cause (a branch
+  switch, an editor save), so that case is still repaired. Measured on a 6.5k-file
+  repo: a prompt hook that took 41s and returned nothing against a cold extraction
+  cache now answers in about a second.
+- **A build lock is free the moment its owner is dead.** The lock names its pid, and
+  `acquireLock` reclaims one whose process is gone instead of waiting five minutes,
+  during which every query answered stale and the background sync was refused. The
+  SIGTERM handler that released it on exit is gone too: a signal listener runs only
+  between event-loop turns, so a `graft ask` inside the synchronous parse loop of a
+  rebuild ignored the hook's timeout for the whole build.
+- **Hook timeouts are written in seconds** (#283), the unit Claude Code reads; the
+  milliseconds written until now made a 15s budget four hours. A repo wired by an
+  older `graft init` keeps working: a legacy value of 1000 or more is read as
+  milliseconds.
+
+## 0.19.0
+
+### Added
+
+- **Push a repo's brain from the terminal** (#422): a loopback handoff hands the
+  browser a finished brain instead of a half-built one — the push waits for the
+  build, then lands the browser on the result.
+- **A public repo can be read without installing the App** (#349): access is
+  answered on its own, without first reading the repo.
+
+### Fixed
+
+- **The finished push lands in Trail** (#417), not on a local page, and signup
+  goes to Trail's own front end rather than the shared agents host.
+- **A repo read runs in a child process** so the app keeps answering while it
+  works, and the digest finishes sending before the child disconnects.
+- **Public reads borrow an installation token** instead of falling back to the
+  anonymous rate limit.
+
 ## 0.18.0
 
 ### Added

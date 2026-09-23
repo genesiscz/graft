@@ -64,7 +64,9 @@ test('runInit updates a prior Graft statusLine whose command still names the hel
   writeFileSync(join(d, '.claude', 'settings.json'), JSON.stringify({
     statusLine: { type: 'command', command: 'node .claude/helpers/graft-statusline.cjs' },
   }));
-  runInit(d, { build: false });
+  // `home` always: without it, init wires the user level of whoever runs the suite —
+  // it rewrote a developer's real ~/.claude/helpers/graft-hooks.cjs on 2026-09-16.
+  runInit(d, { build: false, home: fresh() });
   const s = JSON.parse(readFileSync(join(d, '.claude', 'settings.json'), 'utf8'));
   assert.ok(s.statusLine.command.includes('graft-statusline.cjs'));
   assert.match(s.statusLine.command, /CLAUDE_PROJECT_DIR/);
@@ -72,7 +74,7 @@ test('runInit updates a prior Graft statusLine whose command still names the hel
 
 test('runInit with statusline: false does not write a statusLine', () => {
   const d = fresh();
-  runInit(d, { build: false, statusline: false });
+  runInit(d, { build: false, statusline: false, home: fresh() });
   const s = JSON.parse(readFileSync(join(d, '.claude', 'settings.json'), 'utf8'));
   assert.equal(s.statusLine, undefined);
   assert.equal(s.subagentStatusLine, undefined);

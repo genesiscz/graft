@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/NanoNets/Graft"><img src="https://img.shields.io/github/stars/NanoNets/Graft?style=for-the-badge&logo=github&logoColor=white&label=Star%20on%20GitHub&color=FFC83D" /></a>
-  <a href="https://graft.nanonets.ai"><img src="https://img.shields.io/badge/website-graft.nanonets.ai-546FFF?style=for-the-badge" /></a>
+  <a href="https://trailhq.com/graft"><img src="https://img.shields.io/badge/website-trailhq.com/graft-E5484D?style=for-the-badge" /></a>
   <a href="https://discord.gg/zxmKweAA29"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white" /></a>
   <a href="https://www.npmjs.com/package/@nanonets/graft"><img src="https://img.shields.io/npm/v/%40nanonets%2Fgraft?style=for-the-badge&logo=npm&logoColor=white&label=npm" /></a>
   <a href="https://www.npmjs.com/package/@nanonets/graft"><img src="https://img.shields.io/npm/dm/%40nanonets%2Fgraft?style=for-the-badge&logo=npm&logoColor=white&label=downloads" /></a>
@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/License-MIT-20C997?style=for-the-badge" />
   <a href="TELEMETRY.md"><img src="https://img.shields.io/badge/telemetry-anonymous%2C%20opt--out-546FFF?style=for-the-badge" /></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/NanoNets/Graft"><img src="https://img.shields.io/ossf-scorecard/github.com/NanoNets/Graft?style=for-the-badge&label=openssf%20scorecard" /></a>
-  <a href="https://app.trailhq.com/get-started?step=pick"><img src="https://img.shields.io/badge/Trail%20Brain-try%20it-E5484D?style=for-the-badge&logoColor=white" /></a>
+  <a href="https://app.trailhq.com/get-started?step=repo"><img src="https://img.shields.io/badge/Trail%20Brain-try%20it-E5484D?style=for-the-badge&logoColor=white" /></a>
 </p>
 
 ### Up to **4× cheaper** and **3× faster**, with better or no loss of correctness.
@@ -32,12 +32,17 @@
 </div>
 
 <p align="center">
-  <b>This works beyond code too.</b><br/>
-  A living skill file that learns from every task and gets sharper the more your team works.
+  <b>Stop repeating yourself to your coding agent.</b><br/>
+  You correct it, and by the next session it has forgotten. Trail Brain manages your CLAUDE.md and AGENTS.md so it doesn't.
 </p>
 
 <p align="center">
-  <a href="https://app.trailhq.com/get-started?step=pick"><img src="https://img.shields.io/badge/Try%20Trail%20Brain%20%E2%86%92-E5484D?style=for-the-badge" alt="Try Trail Brain" height="34"/></a>
+  &bull;&nbsp; Every correction you make becomes a rule your agent keeps.<br/>
+  &bull;&nbsp; The ones that can't break get a hook that blocks it, not a note it ignores.
+</p>
+
+<p align="center">
+  <a href="https://app.trailhq.com/get-started?step=repo"><img src="https://img.shields.io/badge/Try%20it%20on%20your%20repo%20%E2%86%92-E5484D?style=for-the-badge" alt="Try it on your repo" height="34"/></a>
 </p>
 
 <p align="center">
@@ -283,6 +288,8 @@ With no TTY to prompt on — CI, a Dockerfile, a piped shell — `init` writes *
 | `--no-hooks` | skip hook installation |
 | `--no-statusline` | skip writing Claude Code `statusLine` (same as `GRAFT_NO_STATUSLINE=1`) |
 | `--no-global` | skip writes outside this repo (the `~/.codex/` entries below) |
+| `--layout repo\|global` | where Claude Code's wiring lives. `repo` (default): settings, shims, skill and `.mcp.json` in the repo. `global`: hooks, MCP server and skill in `~/.claude` only; the repo gets nothing but `graft/`, and the hooks do nothing in a project without a graph |
+| `--ignore gitignore\|exclude\|none` | where graft records what not to commit. `gitignore` (default) edits `.gitignore`; `exclude` uses `.git/info/exclude`, so nothing graft writes is a change to commit; `none` leaves it to you. Remembered in `.graft/config.json` for later builds; `GRAFT_IGNORE` overrides it per process |
 
 #### Writes outside the repo
 
@@ -322,7 +329,7 @@ Where a CLI agent supports user-level `hooks.json`, `init` also installs Graft's
 `graft init` always wires up Claude Code, and Claude Code gets more than the skill file above. From then on, any Claude Code session opened in the repo gets:
 
 - **a live statusline** — graph size, % enriched, and a `⚠ N stale` warning when the code has moved ahead of the graph
-- **auto-sync** — every graft query brings the graph up to date first, so an answer always describes the code as it is right now, uncommitted edits included. A query refreshes only what it reads; the markdown under `graft/` is refreshed by the background rebuild at the end of a turn that touched code. Both are structural and `$0` — auto-sync never calls the LLM on its own
+- **auto-sync** — every graft query brings the graph up to date first, so an answer always describes the code as it is right now, uncommitted edits included. A query refreshes only what it reads; the markdown under `graft/` is refreshed by the background rebuild at the end of every turn, which also picks up edits the agent did not make (a branch switch, an editor save). The hooks themselves never rebuild — they answer from the graph as it is, so a hook always fits its budget on a repo of any size. All of it is structural and `$0` — auto-sync never calls the LLM on its own
 - **context on tap** — each prompt pulls the matching nodes into the session; editing a file surfaces what depends on it ("blast radius"); new sessions start with the repo map
 
 <p align="center">
@@ -395,6 +402,7 @@ graft init --yes                     # no prompt; wire every detected agent
 graft init --no-global               # skip writes outside this repo (~/.codex/ config + hooks)
 graft init --no-statusline           # skip Claude Code statusLine (same as GRAFT_NO_STATUSLINE=1)
 graft init --no-build                # wire the files only; don't build the graph
+graft init --layout global --ignore exclude   # hooks + MCP + skill in ~/.claude only; nothing in the repo to commit
 graft init --all-agents              # wire every known agent, detected or not
 graft init --list-agents             # list known agent ids and exit
 

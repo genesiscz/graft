@@ -1,16 +1,21 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
-import { join, basename, isAbsolute } from 'node:path';
+import { join, basename, isAbsolute, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { readWiring } from './stats.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
 import { indexFreshness, staleBanner } from '../context/check.js';
-import { patchStats, readStats, acquireLock, readSession, writeSession, resolveContextDir } from './state.js';
+import { patchStats, readStats, readSession, writeSession, resolveContextDir } from './state.js';
 import { graftCliPath, claudeScriptPath } from './paths.js';
 import { runUpkeep } from '../upkeep-run.js';
 import { runningVersion } from '../upkeep.js';
 import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js';
 import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
+import { driftCount, probeDrift } from '../graph/fingerprint.js';
+import { hasGraftIndex } from '../graph/root.js';
+import { mainWorktreeRoot } from '../graph/seed.js';
+import { workspacePath } from '../graph/workspace.js';
+import { wiringPath } from '../graph/write.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { classifyToolUse, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
 
@@ -45,16 +50,16 @@ const MIN_CHILD_TIMEOUT_MS = 4000;
 /**
  * How long the prompt hook may let `graft ask` run — derived from the budget that is
  * *actually installed* in this repo's `.claude/settings.json`, not from what the
- * current version of `settings-merge.ts` would install.
+ * current version of `settings-merge.ts` would install. `mergeGraftSettings` only
+ * runs during `graft init` — upgrading the npm package does not re-run it — so a repo
+ * wired before the budget was raised to 15s still runs under 8s, and a child sized
+ * for 15s there gets the whole hook killed by Claude Code: `emit()` and
+ * `writeSession()` never run and the turn gets no retrieval pack at all.
  *
- * A query now brings the graph up to date first, so `graft init` raises the
- * UserPromptSubmit budget to 15s to cover the one cold rebuild after an upgrade. But
- * `mergeGraftSettings` only runs during `graft init` — upgrading the npm package does
- * not re-run it. So every repo wired before that change keeps `"timeout": 8000`, and
- * hard-coding a 13s child there means Claude Code kills the hook first: `emit()` and
- * `writeSession()` never run, the turn gets no retrieval pack at all, and the SIGKILLed
- * child can't even release the build lock. Reading the installed number keeps the child
- * strictly inside whatever budget this repo really has.
+ * The child never rebuilds (it asks `--no-refresh`), so this budget covers reading
+ * the graph and answering, which is seconds even on a big one. It is not a budget
+ * for a rebuild, and could not be: a rebuild is one synchronous tree-sitter pass, and
+ * the SIGTERM this timeout sends cannot interrupt it, only the host's hard kill can.
  */
 export function promptAskTimeout(dir: string): number {
   const installed = installedHookTimeout(dir, 'UserPromptSubmit');
@@ -77,8 +82,13 @@ function hookSettingsFiles(dir: string): string[] {
   ];
 }
 
-/** The timeout on one settings file's graft hook entry for `event`, or null if it
- * can't be read (no settings file, hand-edited shape, unparseable JSON). */
+/** The timeout on one settings file's graft hook entry for `event`, in milliseconds,
+ * or null if it can't be read (no settings file, hand-edited shape, unparseable JSON).
+ *
+ * Claude Code reads the installed number as seconds. Inits before 0.19 wrote it as
+ * milliseconds (#283), and those entries stay in place until someone re-runs `graft
+ * init`, so both units arrive here: nobody budgets a hook in whole minutes, and
+ * nobody budgets one under a second, so a value of 1000 or more is milliseconds. */
 function hookTimeoutIn(file: string, event: string): number | null {
   try {
     const settings = JSON.parse(readFileSync(file, 'utf8')) as any;
@@ -87,7 +97,7 @@ function hookTimeoutIn(file: string, event: string): number | null {
     for (const block of blocks) {
       for (const h of block?.hooks ?? []) {
         if (typeof h?.command === 'string' && h.command.includes('graft-hooks.cjs') && typeof h.timeout === 'number') {
-          return h.timeout;
+          return h.timeout >= 1000 ? h.timeout : h.timeout * 1000;
         }
       }
     }
@@ -119,12 +129,11 @@ function installedHookTimeout(dir: string, event: string): number | null {
 }
 
 /**
- * Append `--dir <contextDir>` for the hooks' own `graft ask`/`graft check`
- * children — the one place in this file that spawns the CLI itself rather
- * than reading `graft/` off disk (which already resolves through
- * `resolveContextDir` inside `util/state.ts` and `claude/stats.ts`). A no-op
- * when `GRAFT_DIR` isn't set, so an unconfigured repo's spawned CLI sees
- * byte-identical argv to before this existed.
+ * Append `--dir <contextDir>` for the prompt hook's `graft ask` child — the one
+ * place in this file that spawns the CLI at all, rather than reading `graft/` off
+ * disk (which already resolves through `resolveContextDir` inside `util/state.ts`
+ * and `claude/stats.ts`). A no-op when `GRAFT_DIR` isn't set, so an unconfigured
+ * repo's spawned CLI sees byte-identical argv to before this existed.
  */
 function withContextDirArg(dir: string, args: string[]): string[] {
   return process.env.GRAFT_DIR ? [...args, '--dir', resolveContextDir(dir)] : args;
@@ -133,26 +142,63 @@ function withContextDirArg(dir: string, args: string[]): string[] {
 function graftJson(dir: string, args: string[], timeout: number = CHILD_TIMEOUT_MS): any | null {
   try {
     // GRAFT_TEST_CLI is a test seam (mirrors GRAFT_TEST_STDIN/GRAFT_TEST_SYNC_RUN) so
-    // tests can point the prompt hook's `graft ask`/`graft check` calls at a stub
-    // script and observe the exact args it was invoked with, instead of shelling
-    // out to the real CLI (which isn't built relative to the TS source under test).
+    // tests can point the prompt hook's `graft ask` call at a stub script and observe
+    // the exact args it was invoked with, instead of shelling out to the real CLI
+    // (which isn't built relative to the TS source under test).
     const cliPath = process.env.GRAFT_TEST_CLI ?? graftCliPath();
     const out = execFileSync(process.execPath, [cliPath, ...args],
       { cwd: dir, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
     return JSON.parse(out);
   } catch (e: any) {
-    // `graft check` exits non-zero when the graph is stale (by design) but still
-    // prints valid JSON to stdout; recover it from the thrown error before giving up.
+    // A command that exits non-zero can still have printed valid JSON to stdout;
+    // recover it from the thrown error before giving up.
     if (e && typeof e.stdout === 'string' && e.stdout.trim()) {
       try { return JSON.parse(e.stdout); } catch { /* not JSON — fall through */ }
     }
     return null;
   }
 }
-function checkStaleCount(dir: string): number {
-  const r = graftJson(dir, withContextDirArg(dir, ['check', '.', '--json']));
-  const g = r?.graph ?? {};
-  return (g.changed?.length ?? 0) + (g.added?.length ?? 0) + (g.removed?.length ?? 0);
+/**
+ * `--no-refresh` on the hook's `graft ask`. A hook lives inside a budget of seconds,
+ * and a query's pre-answer refresh (`graph/refresh.ts`) is a rebuild with no ceiling:
+ * measured on a 6.6k-file repo, 2.3s with a warm extraction cache and 37.8s with a
+ * cold one, against a 15s budget — after which the host killed the hook and discarded
+ * its output, so the turn paid the wait AND lost the pack. The detached end-of-turn
+ * sync (`sync-run.ts`) owns rebuilding.
+ *
+ * Only the query commands declare this flag. `check` is the drift REPORT and never
+ * refreshes, so commander rejects the option there — it would exit 1 with no stdout.
+ */
+const NO_REFRESH = '--no-refresh';
+
+/**
+ * How many files have moved since the last build, for the statusline's `⚠ N stale`.
+ *
+ * In-process, from the same stat-based probe `ensureFreshGraph` uses to decide whether
+ * to rebuild, so the bar and the rebuild can never disagree. This used to spawn `graft
+ * check --json`, which re-hashes every file AND diffs every markdown card: 35.2s on a
+ * 6.6k-file repo, against a child cap of 8s. So it was killed on every single edit,
+ * `graftJson` returned null, and the bar read `0` — 8.2s of dead wall clock per edit
+ * buying a number that was always wrong. The probe is 85ms on the same repo and
+ * returns the real count (#366).
+ *
+ * Null means unknown: no fingerprint for this build (a new graft version, or a graph
+ * from before probes existed), or the probe failed. The next build lays one down.
+ */
+function staleCount(dir: string): number | null {
+  try {
+    const drift = probeDrift(dir, resolveContextDir(dir));
+    return drift ? driftCount(drift) : null;
+  } catch {
+    return null; // a statusline number is never worth failing an edit hook over
+  }
+}
+
+/** Is `file` inside the project `dir`? An agent also edits files elsewhere (a temp
+ * file, a sibling checkout), and those say nothing about this graph. */
+function insideProject(dir: string, file: string): boolean {
+  const rel = relative(dir, isAbsolute(file) ? file : join(dir, file));
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 function emit(eventName: string, additionalContext: string): void {
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext } }));
@@ -183,8 +229,13 @@ export function editedFilePath(input: any, dir: string): string | null {
 
 async function handlePostEdit(input: any, dir: string): Promise<void> {
   const file = editedFilePath(input, dir);
-  if (!file || underGraft(dir, file)) return;
-  patchStats(dir, { dirty: true, staleCount: checkStaleCount(dir), lastFile: basename(file) });
+  if (!file || underGraft(dir, file) || !insideProject(dir, file)) return;
+  // Dirty only when the probe finds drift or cannot tell. A probe that reads the
+  // fingerprint and finds nothing moved (the edit restored the bytes, or touched a
+  // file the graph does not index) means the graph is current: marking it dirty
+  // showed "graph may be behind" and made the end-of-turn sync rebuild for nothing.
+  const count = staleCount(dir);
+  patchStats(dir, { dirty: count !== 0, staleCount: count ?? 0, lastFile: basename(file) });
   const w = readWiring(dir);
   if (w) { const br = formatBlastRadius(w, file); if (br) emit('PostToolUse', br); }
 }
@@ -373,27 +424,57 @@ function countTallyTurn(input: any, dir: string): void {
   }
 }
 
-function handleStop(input: any, dir: string): void {
-  sampleTurnCost(input, dir);
-  countTallyTurn(input, dir);
+/**
+ * Hand the end-of-turn rebuild to a detached `sync-run.js`. A hand-off only: the
+ * child takes the build lock under its own pid and decides for itself whether there
+ * is anything to rebuild — `dirty` from the agent's edits, or drift the agent did not
+ * cause — so a turn that changed nothing costs one short-lived process and no build.
+ * Spawning every turn rather than only on `dirty` is what repairs a branch switch or
+ * an editor save, now that no hook refreshes inline. The hook takes no lock and flips
+ * no flag: a lock held under the hook's pid would read as abandoned the moment the
+ * hook exited, while the child it was taken for was still building.
+ */
+function spawnBackgroundSync(dir: string): void {
   // sync-run.js ships next to this module inside the package, so it resolves in
   // any repo that installs graft (not just graft's own). Defensive existsSync:
-  // if the package is somehow incomplete, skip rather than wedge on syncing:true.
+  // if the package is somehow incomplete, skip rather than fail the hook.
   // GRAFT_TEST_SYNC_RUN is a test seam (mirrors GRAFT_TEST_STDIN) so tests can point
   // this at a stub file inside their own sandbox instead of writing into src/claude/.
   const syncRun = process.env.GRAFT_TEST_SYNC_RUN ?? claudeScriptPath('sync-run.js');
   if (!existsSync(syncRun)) return;
-  const stats = readStats(dir);
-  if (stats?.dirty && acquireLock(dir)) {
-    patchStats(dir, { syncing: true });
-    const child = spawn(process.execPath, [syncRun, dir], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.unref();
-  }
+  const child = spawn(process.execPath, [syncRun, dir], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+}
+
+function handleStop(input: any, dir: string): void {
+  sampleTurnCost(input, dir);
+  countTallyTurn(input, dir);
+  spawnBackgroundSync(dir);
+}
+
+/**
+ * Does this project have a graph to serve, here or in the main worktree it was
+ * branched from (seeding gives a fresh worktree its graph on first query)?
+ *
+ * The user-level install fires every hook in every project Claude Code opens,
+ * indexed or not. Without this, the tool and stop hooks recorded stats and
+ * session files into a `graft/.cache/` they created in repos nobody indexed,
+ * and each call paid for loading the handler first. Cost here: two stats, plus
+ * one small file read when `.git` is a worktree pointer.
+ */
+export function hasGraph(dir: string): boolean {
+  if (existsSync(wiringPath(resolveContextDir(dir))) || existsSync(workspacePath(dir))) return true;
+  const main = mainWorktreeRoot(dir);
+  return main !== null && hasGraftIndex(main);
 }
 
 export async function main(event: string): Promise<void> {
   const input = readStdin();
   const dir = projectDir(input);
+
+  // session-start still runs without a graph: its upkeep refreshes a repo-level
+  // wiring an older graft wrote, and it writes nothing when there is none.
+  if (event !== 'session-start' && !hasGraph(dir)) return;
 
   if (event === 'session-start') {
     // Before anything is emitted: refresh this repo's wiring if it was written by
@@ -443,7 +524,7 @@ export async function main(event: string): Promise<void> {
     // pulls spans itself via `graft ask --source` when a pointer looks right.
     // relevantRetrieval then drops the pack entirely when the prompt barely
     // overlaps the top hit or when every hit was already injected this session.
-    const askArgs = withContextDirArg(dir, ['ask', prompt, '.', '--json', '-n', '3']);
+    const askArgs = withContextDirArg(dir, ['ask', prompt, '.', '--json', '-n', '3', NO_REFRESH]);
     // "You're working in backend/, weight it": only fires on a multi-scope
     // repo whose lastFile resolves cleanly to one scope — see lastFileScopeHint.
     const scopeHint = lastFileScopeHint(dir, readStats(dir)?.lastFile);

@@ -76,32 +76,15 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Release the lock if this process is asked to die while holding it. Returns the
- * un-hook.
- *
- * Not hypothetical: the Claude Code prompt hook runs `graft ask` with a timeout, and
- * `execFileSync` enforces it with SIGTERM. Node's default disposition for SIGTERM is
- * to exit without unwinding, so the `finally` below never runs and the lock outlives
- * the process — after which the background sync is blocked and every query waits and
- * then answers stale until the lock ages out. Ctrl-C on a CLI query is the same story
- * with SIGINT.
- *
- * Adding a listener replaces that default disposition, so re-raise it explicitly
- * afterwards: remove ourselves, then `process.kill(process.pid, sig)`, so the exit
- * status still says "terminated by signal" for whoever is waiting on us.
+ * There is deliberately no signal handler around the lock. One existed, to release
+ * it when a `graft ask` under a hook's `execFileSync` timeout was SIGTERMed, and it
+ * turned that kill into a wait: a listener runs only between event-loop turns, and a
+ * rebuild is one long synchronous tree-sitter pass, so the child ignored the signal
+ * until the whole build was done (41s on a 6.5k-file repo, inside a 15s hook budget)
+ * and the host killed the hook itself instead. With node's default disposition the
+ * kill lands at once, and the lock the dead process leaves behind is reclaimed by the
+ * next comer, because the lock names its pid (`acquireLockIn`).
  */
-export function releaseOnSignal(cache: string): () => void {
-  const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
-  const onSignal = (sig: NodeJS.Signals) => {
-    releaseLockIn(cache);
-    for (const s of signals) process.removeListener(s, onSignal);
-    process.kill(process.pid, sig);
-  };
-  for (const s of signals) process.once(s, onSignal);
-  return () => {
-    for (const s of signals) process.removeListener(s, onSignal);
-  };
-}
 
 /** Wait out someone else's rebuild, then take the lock. False when we couldn't. */
 async function waitForLock(cache: string): Promise<boolean> {
@@ -131,11 +114,9 @@ async function seedUnderLock(
   // caller that stayed silent here would emit the bare "no matching nodes" this whole
   // mechanism exists to remove. Say what happened instead.
   if (!(await waitForLock(lockCache))) return { seeded: false, busy: true };
-  const unhook = releaseOnSignal(lockCache);
   try {
     return seedGraph(dir, { contextDir });
   } finally {
-    unhook();
     releaseLockIn(lockCache);
   }
 }
@@ -191,7 +172,6 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
         note: seedNote ? `${seedNote}; ${busy}` : busy,
       };
     }
-    const unhook = releaseOnSignal(lockCache);
     try {
       // We may have queued behind another process's rebuild for up to LOCK_WAIT_MS,
       // and that rebuild very likely fixed the same drift we saw. Re-probe rather
@@ -217,7 +197,6 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       invalidateGraphCaches(outDir);
       return { refreshed: true, drift: drift ?? undefined, note: seedNote };
     } finally {
-      unhook();
       releaseLockIn(lockCache);
     }
   } catch (err) {

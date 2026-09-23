@@ -83,11 +83,13 @@ test('session-start says nothing on a second run — the stamp now matches', asy
   assert.doesNotMatch(ctx, /refreshed this repo's agent wiring/);
 });
 
-test('session-start surfaces a cached upgrade nudge', async () => {
+test('session-start never puts the upgrade line into the agent context', async () => {
+  // The agent cannot act on it, and it cost tokens on every session. The
+  // statusline and an interactive CLI carry it instead.
   const repo = wiredRepo('hook-nudge');
   const ctx = contextOf(await runHook('session-start', repo, homeWithCache('hook-nudge-home', '99.0.0')));
-  assert.match(ctx, /graft .* → 99\.0\.0 available/);
-  assert.match(ctx, /npm i -g @nanonets\/graft@latest/);
+  assert.doesNotMatch(ctx, /available/);
+  assert.doesNotMatch(ctx, /npm i -g/);
 });
 
 test('an up-to-date install gets no nudge', async () => {
@@ -103,7 +105,7 @@ test('a stale cache is used as-is: the hook never fetches', async () => {
   const home = homeWithCache('hook-stale-home', '99.0.0', 2 * 24 * 60 * 60 * 1000);
   const before = Date.now();
   const ctx = contextOf(await runHook('session-start', repo, home));
-  assert.match(ctx, /99\.0\.0 available/, 'stale answer still shown rather than refetched');
+  assert.doesNotMatch(ctx, /available/);
   assert.ok(Date.now() - before < 2000, 'no network round trip');
 });
 
@@ -114,8 +116,8 @@ test('an unwired repo is left completely alone', async () => {
   assert.equal(existsSync(join(repo, '.claude')), false, 'never wires a repo that was not wired');
 });
 
-test('a nudge still lands in a wired repo with no graph built yet', async () => {
+test('a wired repo with no graph built yet gets no upgrade line either', async () => {
   const repo = wiredRepo('hook-nograph');
   const ctx = contextOf(await runHook('session-start', repo, homeWithCache('hook-nograph-home', '99.0.0')));
-  assert.match(ctx, /99\.0\.0 available/, 'the no-INDEX.md path still reports upkeep');
+  assert.doesNotMatch(ctx, /available/);
 });

@@ -11,6 +11,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
+import { ensureIgnored } from './ignore.js';
 
 export interface Stats {
   nodeCount: number; edgeCount: number; languages: string[];
@@ -107,6 +108,9 @@ export interface BuildConfig {
    * `~/.graft/`, because a brain belongs to one repository and two checkouts on
    * one machine must not share one. `undefined` clears it. */
   brain?: { brainId: string; token: string; baseUrl?: string };
+  /** Where graft records "do not commit" for what it writes here: `.gitignore`,
+   * `.git/info/exclude`, or nowhere (util/ignore.ts). Set by `graft init --ignore`. */
+  ignore?: 'gitignore' | 'exclude' | 'none';
 }
 
 /** Local, Git-ignored repository configuration. Kept outside generated
@@ -119,23 +123,15 @@ export function buildConfigPath(d: string): string { return join(d, BUILD_CONFIG
 /** Keep local build configuration out of Git without coupling it to the
  * generated graph directory. Best-effort, matching graph-cache ignore setup. */
 function ensureBuildConfigIgnored(d: string): void {
-  const path = join(d, '.gitignore');
-  let current = '';
-  try { current = readFileSync(path, 'utf8'); } catch { /* no .gitignore yet */ }
-  const present = current.split('\n').some((line) => {
-    const value = line.trim();
-    return value === BUILD_CONFIG_DIR || value === `${BUILD_CONFIG_DIR}/` || value === `/${BUILD_CONFIG_DIR}/`;
-  });
-  if (present) return;
-  const gap = current === '' ? '' : current.endsWith('\n') ? '\n' : '\n\n';
-  const block = `${gap}# graft's local repository settings — not committed.\n/${BUILD_CONFIG_DIR}/\n`;
-  try { writeFileSync(path, current + block); } catch { /* best-effort */ }
+  ensureIgnored(d, BUILD_CONFIG_DIR, { note: "graft's local repository settings — not committed.", dir: true, secret: true });
 }
 
 export function readBuildConfig(d: string): BuildConfig | null { return readJson<BuildConfig>(buildConfigPath(d)); }
 export function writeBuildConfig(d: string, c: BuildConfig): void {
-  ensureBuildConfigIgnored(d);
+  // Written first: the ignore step reads the mode from this very file, so the run
+  // that sets `ignore: 'exclude'` must not still record `.graft/` in `.gitignore`.
   writeJsonAtomic(buildConfigPath(d), c);
+  ensureBuildConfigIgnored(d);
 }
 
 /** Merge explicit CLI choices into the existing local config, so updating one
@@ -183,6 +179,15 @@ export function releaseLock(d: string): void {
  * `<root>/graft/.cache` these are the same file, which is the point: the Claude Code
  * hooks lock by project dir and the graph's auto-refresh locks by the context dir it
  * is actually writing, and the two must collide so they can't rebuild at once.
+ *
+ * A lock names the pid that took it, and a lock whose owner is gone is free at once.
+ * Every holder can die without unwinding — SIGKILL from a host enforcing a hook
+ * budget, a session closing over a detached sync, a build OOM — and no `finally`
+ * runs for any of those. Waiting `LOCK_STALE_MS` (the only rule until now) meant five
+ * minutes in which every query answered from a stale graph and the background sync
+ * was refused, on the strength of a file nobody was holding. The mtime rule stays as
+ * the fallback for a lock this process cannot judge: an unreadable payload, or a pid
+ * that was reused.
  */
 export function acquireLockIn(cache: string): boolean {
   const p = join(cache, LOCK_FILE);
@@ -193,12 +198,40 @@ export function acquireLockIn(cache: string): boolean {
     return true;
   } catch (e: any) {
     if (e?.code !== 'EEXIST') throw e;
-    let stale: boolean;
-    try { stale = Date.now() - statSync(p).mtimeMs >= LOCK_STALE_MS; } catch { stale = true; }
-    if (!stale) return false;
+    if (!lockIsStale(p)) return false;
     try { rmSync(p); } catch { /* another process reclaimed it */ }
     try { writeFileSync(p, payload, { flag: 'wx' }); return true; }
     catch (e2: any) { if (e2?.code === 'EEXIST') return false; throw e2; }
+  }
+}
+
+/** Dead owner, or older than `LOCK_STALE_MS`, or gone from under us. */
+function lockIsStale(p: string): boolean {
+  const owner = lockOwner(p);
+  if (owner !== null && !processAlive(owner)) return true;
+  try { return Date.now() - statSync(p).mtimeMs >= LOCK_STALE_MS; } catch { return true; }
+}
+
+function lockOwner(p: string): number | null {
+  try {
+    const pid = JSON.parse(readFileSync(p, 'utf8'))?.pid;
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `kill(pid, 0)` delivers nothing; it only asks whether the pid exists. EPERM means
+ * it does, under another user, which counts as alive here. ESRCH is the one answer
+ * that says it is gone; anything else is not evidence and reads as alive.
+ */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code !== 'ESRCH';
   }
 }
 export function releaseLockIn(cache: string): void {
