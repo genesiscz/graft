@@ -47,6 +47,7 @@ import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
+import { isHomeDir } from "./util/home.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { setInputRate } from "./context/savings.js";
 import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
@@ -967,6 +968,10 @@ program
       brainLink = parsed;
     }
     const repo = resolve(dir);
+    if (isHomeDir(repo)) {
+      console.error("✗ refusing to init your home directory: its .claude/ and .mcp.json are your user-level config, not a repo's. Run graft init inside a repository.");
+      process.exit(1);
+    }
     const explicit = Array.isArray(opts.agents) ? opts.agents : undefined;
 
     if (explicit) {

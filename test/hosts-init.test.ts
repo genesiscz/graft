@@ -66,6 +66,15 @@ test('CLI: graft init --agents gemini writes GEMINI.md and exits 0', () => {
   assert.ok(readFileSync(join(repo, 'GEMINI.md'), 'utf8').includes('graft ask'));
 });
 
+test('CLI: graft init refuses the home directory and writes nothing there', () => {
+  const home = fresh();
+  const res = runCli(['init', home, '--no-build', '--agents', 'claude'], { home });
+  assert.equal(res.status, 1, res.describe());
+  assert.match(res.stderr, /refusing to init your home directory/);
+  assert.equal(existsSync(join(home, '.claude')), false);
+  assert.equal(existsSync(join(home, '.mcp.json')), false);
+});
+
 test('CLI: unknown agent id exits non-zero', () => {
   const home = fresh(); const repo = fresh();
   const res = runCli(['init', repo, '--no-build', '--agents', 'nope'], { home });

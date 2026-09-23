@@ -136,6 +136,33 @@ test('by default a refresh DOES reach ~/.codex — nothing else ever would', () 
   assert.equal(r?.global, true);
 });
 
+test('a refresh never treats the home directory as a repo', () => {
+  // At $HOME the user-level shim IS `<repo>/.claude/helpers/graft-hooks.cjs`, so
+  // wiredHostIds reports claude as wired there. Replaying init at $HOME would write
+  // the repo-level hooks block into ~/.claude/settings.json.
+  const home = tmpRepo('upkeep-home');
+  mkdirSync(join(home, '.claude', 'helpers'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'helpers', 'graft-hooks.cjs'), '// user-level shim');
+  const saved = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    let rewrites = 0;
+    const r = reconcileWiring(home, '2.0.0', { rewrite: () => { rewrites++; } });
+    assert.equal(r, null);
+    assert.equal(rewrites, 0);
+    assert.equal(existsSync(stampPath(home)), false, 'no stamp written either');
+
+    // Negative control: the same layout one level down is a real repo and IS refreshed.
+    const repo = join(home, 'project');
+    mkdirSync(join(repo, '.claude', 'helpers'), { recursive: true });
+    writeFileSync(join(repo, '.claude', 'helpers', 'graft-hooks.cjs'), '// shim');
+    reconcileWiring(repo, '2.0.0', { rewrite: () => { rewrites++; } });
+    assert.equal(rewrites, 1);
+  } finally {
+    process.env.HOME = saved;
+  }
+});
+
 test('wiredHostIds reads what init actually wrote, not what the machine has', () => {
   const repo = tmpRepo('upkeep-wired');
   assert.deepEqual(wiredHostIds(repo), [], 'unwired repo');

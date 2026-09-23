@@ -34,6 +34,7 @@ import { START } from './hosts/sections.js';
 import { getNpmViewVersion, readCurrentVersion } from './cli-meta.js';
 import { cacheIsStale, markRulesChecked, readLink, readRulesCache } from './brain/link.js';
 import { graftCliPath } from './claude/paths.js';
+import { isHomeDir } from './util/home.js';
 
 /**
  * The version of the graft package this code was loaded from.
@@ -304,6 +305,8 @@ export function reconcileWiring(
   },
 ): WiringRefresh | null {
   try {
+    // `~/.claude/` is the user config, not a repo's; see util/home.ts.
+    if (isHomeDir(repo)) return null;
     const stamp = readStamp(repo);
     if (stamp && stamp.version === current) return null;
     // The stamp is the record of *intent* (what the picker chose); disk is the
