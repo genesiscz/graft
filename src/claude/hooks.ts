@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
-import { join, basename, isAbsolute } from 'node:path';
+import { join, basename, isAbsolute, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { readWiring } from './stats.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
@@ -182,16 +182,23 @@ const NO_REFRESH = '--no-refresh';
  * buying a number that was always wrong. The probe is 85ms on the same repo and
  * returns the real count (#366).
  *
- * Null means no fingerprint (a graph from before probes existed): report 0 rather
- * than guessing, the next build lays one down.
+ * Null means unknown: no fingerprint for this build (a new graft version, or a graph
+ * from before probes existed), or the probe failed. The next build lays one down.
  */
-function staleCount(dir: string): number {
+function staleCount(dir: string): number | null {
   try {
     const drift = probeDrift(dir, resolveContextDir(dir));
-    return drift ? driftCount(drift) : 0;
+    return drift ? driftCount(drift) : null;
   } catch {
-    return 0; // a statusline number is never worth failing an edit hook over
+    return null; // a statusline number is never worth failing an edit hook over
   }
+}
+
+/** Is `file` inside the project `dir`? An agent also edits files elsewhere (a temp
+ * file, a sibling checkout), and those say nothing about this graph. */
+function insideProject(dir: string, file: string): boolean {
+  const rel = relative(dir, isAbsolute(file) ? file : join(dir, file));
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 function emit(eventName: string, additionalContext: string): void {
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext } }));
@@ -222,8 +229,13 @@ export function editedFilePath(input: any, dir: string): string | null {
 
 async function handlePostEdit(input: any, dir: string): Promise<void> {
   const file = editedFilePath(input, dir);
-  if (!file || underGraft(dir, file)) return;
-  patchStats(dir, { dirty: true, staleCount: staleCount(dir), lastFile: basename(file) });
+  if (!file || underGraft(dir, file) || !insideProject(dir, file)) return;
+  // Dirty only when the probe finds drift or cannot tell. A probe that reads the
+  // fingerprint and finds nothing moved (the edit restored the bytes, or touched a
+  // file the graph does not index) means the graph is current: marking it dirty
+  // showed "graph may be behind" and made the end-of-turn sync rebuild for nothing.
+  const count = staleCount(dir);
+  patchStats(dir, { dirty: count !== 0, staleCount: count ?? 0, lastFile: basename(file) });
   const w = readWiring(dir);
   if (w) { const br = formatBlastRadius(w, file); if (br) emit('PostToolUse', br); }
 }

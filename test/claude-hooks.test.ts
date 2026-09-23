@@ -85,6 +85,38 @@ test('post-edit counts drift in-process and spawns no child', async () => {
   }
 });
 
+test('post-edit leaves the graph clean when nothing it indexes moved, or the file is elsewhere', async () => {
+  // Observed in a real repo: an agent edited a file in another folder, the hook marked
+  // this graph dirty, the probe counted 0, and the bar said "graph may be behind".
+  const d = mkdtempSync(join(tmpdir(), 'graft-hooks-clean-'));
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b;\n}\n');
+  await buildGraph(d);
+  writeStats(d, { ...emptyStats(), nodeCount: 1 });
+  const elsewhere = mkdtempSync(join(tmpdir(), 'graft-elsewhere-'));
+  writeFileSync(join(elsewhere, 'scenarios.ts'), 'export const s = 1;\n');
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(elsewhere, 'scenarios.ts') } }), () => main('post-edit'));
+    assert.equal(readStats(d)!.dirty, false, 'an edit outside the project says nothing about this graph');
+    assert.equal(readStats(d)!.lastFile, null);
+
+    // Inside the project, but the bytes did not change: the probe reads a clean tree.
+    writeFileSync(join(d, 'src', 'math.ts'), 'export function add(a: number, b: number): number {\n  return a + b;\n}\n');
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'math.ts') } }), () => main('post-edit'));
+    assert.equal(readStats(d)!.dirty, false);
+    assert.equal(readStats(d)!.lastFile, 'math.ts');
+
+    // Negative control: a real change inside the project still marks it dirty, with a count.
+    writeFileSync(join(d, 'src', 'math.ts'), 'export const changed = 2;\n');
+    await runWithStdin(JSON.stringify({ tool_input: { file_path: join(d, 'src', 'math.ts') } }), () => main('post-edit'));
+    assert.equal(readStats(d)!.dirty, true);
+    assert.equal(readStats(d)!.staleCount, 1);
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
 // helper: hooks.ts reads process.env.GRAFT_TEST_STDIN first (test seam), else fd 0.
 async function runWithStdin(text: string, fn: () => Promise<void>): Promise<void> {
   process.env.GRAFT_TEST_STDIN = text;
