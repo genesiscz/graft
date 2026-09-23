@@ -40,8 +40,17 @@ export const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000;
 /** The one path the listener answers on. */
 export const CALLBACK_PATH = "/graft/callback";
 
-/** What the browser sends back, or why it could not be accepted. */
-export type HandoffResult = { link: BrainLink } | { error: string };
+/**
+ * What the browser sends back, or why it could not be accepted.
+ *
+ * `error` is the sentence printed to the user and `reason` is the same fact as a
+ * category. They are separate because the sentence names the repo and the link,
+ * so it can never be the thing telemetry reports — and matching on its text to
+ * recover the category would put a user-facing string in a position where
+ * rewording it silently changes what gets counted.
+ */
+export type HandoffFailure = "timed_out" | "bad_callback";
+export type HandoffResult = { link: BrainLink } | { error: string; reason: HandoffFailure };
 
 export interface Handoff {
   /** The loopback port Trail must redirect to. */
@@ -107,12 +116,15 @@ export async function startHandoff(): Promise<Handoff> {
     if (!brainId || !token) {
       res.writeHead(400, { "content-type": "text/html; charset=utf-8" });
       res.end(donePage(false));
-      settle({ error: "the browser came back without a brain id and token" });
+      settle({ error: "the browser came back without a brain id and token", reason: "bad_callback" });
       return;
     }
 
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(donePage(true));
+    // 303 so the browser issues a plain GET, and Location built from
+    // GRAFT_BRAIN_URL rather than anything the query carried — the same reason
+    // the Trail side builds its callback rather than being told one.
+    res.writeHead(303, { location: brainUrl(brainId), "cache-control": "no-store" });
+    res.end();
     // No `baseUrl` stored, matching `connect`: GRAFT_BRAIN_URL is read again on
     // every use, so persisting it here would only freeze a host that the env
     // var is already free to move.
@@ -143,7 +155,7 @@ export async function startHandoff(): Promise<Handoff> {
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<HandoffResult>((resolve) => {
         timer = setTimeout(
-          () => resolve({ error: "timed out waiting for the browser — run `graft brain push` again, or use the link above" }),
+          () => resolve({ error: "timed out waiting for the browser — run `graft brain push` again, or use the link above", reason: "timed_out" }),
           timeoutMs,
         );
         // The timer must not hold the process open once the browser has answered.
@@ -159,9 +171,34 @@ export async function startHandoff(): Promise<Handoff> {
   };
 }
 
+/** The Trail front end this machine is pointed at, without a trailing slash.
+ *
+ * Read at the moment it is needed rather than captured once, matching the rest
+ * of the brain code: GRAFT_BRAIN_URL is free to move between calls. */
+export function webBaseUrl(baseUrl?: string): string {
+  return (process.env.GRAFT_BRAIN_URL || baseUrl || DEFAULT_WEB_BASE_URL).replace(/\/+$/, "");
+}
+
+/** Where the browser is sent once the handoff has been accepted.
+ *
+ * Back into Trail, at the screen that shows the brain being built. The
+ * alternative — leaving the person on a local page that says "go back to your
+ * terminal" — ends the flow on a blank throwaway served by a port that is about
+ * to close, at exactly the moment there is something to watch.
+ *
+ * NOT `/brain/<id>`, which is where this pointed first. That route redirects to
+ * the brain's graph, and the redirect fires the instant the row exists — which
+ * is minutes before it has any rules in it. Every terminal signup therefore
+ * landed on an empty visualisation of a brain that was, at that moment, being
+ * built perfectly well. The build screen is the same wait the browser-first
+ * flow shows, and it leads to the graph once there is a graph. */
+export function brainUrl(brainId: string, baseUrl?: string): string {
+  return `${webBaseUrl(baseUrl)}/get-started?step=build&brain=${encodeURIComponent(brainId)}`;
+}
+
 /** Where to send the browser for a repo's brain. */
 export function signupUrl(opts: { repo: string; port: number; state: string; baseUrl?: string }): string {
-  const base = (process.env.GRAFT_BRAIN_URL || opts.baseUrl || DEFAULT_WEB_BASE_URL).replace(/\/+$/, "");
+  const base = webBaseUrl(opts.baseUrl);
   const q = new URLSearchParams({
     step: "repo",
     graft_repo: opts.repo,

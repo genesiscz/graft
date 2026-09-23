@@ -22,6 +22,7 @@ import { rulesForPointers } from "./brain/attach.js";
 import { clearLink, type BrainLink } from "./brain/link.js";
 import { buildLocalDigest, fetchExpectedRepo, pushDigest, repoSlugFromGit, sameRepo } from "./brain/push.js";
 import { readLink, writeLink } from "./brain/link.js";
+import { watchBuild } from "./brain/watch.js";
 import { openBrowser, signupUrl, startHandoff } from "./brain/signup.js";
 import { contextDirFor } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
@@ -1251,6 +1252,13 @@ const brain = program
 async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | null> {
   const handoff = await startHandoff();
   const url = signupUrl({ repo: slug, port: handoff.port, state: handoff.state });
+  const startedAt = Date.now();
+
+  // Queued before the link is printed rather than after the outcome, because
+  // the outcome is the one thing a terminal handoff can lose: a user who reads
+  // the URL and walks away kills the process, and only an event already on disk
+  // survives that. This is the denominator; `brain_signup_settled` is not.
+  track("brain_signup_opened", {}, { repo });
 
   // Printed before the browser opens, and printed whether or not it opens: on a
   // remote shell nothing can open, and on a desktop the window sometimes lands
@@ -1262,6 +1270,10 @@ async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | n
   // minutes for a browser that will never come is worse than saying so now.
   if (!process.stderr.isTTY) {
     console.error("· not a terminal — open that link, then run `graft brain connect <brainId>:<token>` here");
+    // Its own outcome, not a timeout: nothing here could have opened a browser,
+    // so folding the two together would read as people abandoning signup when
+    // it is only a remote shell doing what it has to.
+    track("brain_signup_settled", { outcome: "no_tty", duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
     handoff.close();
     return null;
   }
@@ -1272,10 +1284,13 @@ async function signUpForBrain(repo: string, slug: string): Promise<BrainLink | n
   const got = await handoff.wait();
   if ("error" in got) {
     console.error(`✗ ${got.error}`);
+    // The category, never the sentence: `got.error` names the repo and the link.
+    track("brain_signup_settled", { outcome: got.reason, duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
     return null;
   }
   writeLink(repo, got.link);
   console.error(`✓ brain connected to ${slug}`);
+  track("brain_signup_settled", { outcome: "linked", duration_bucket: durationBucket(Date.now() - startedAt) }, { repo });
   return got.link;
 }
 
@@ -1334,7 +1349,8 @@ brain
   .description("Read THIS repo on your machine and build its brain — no GitHub App, works on private repos")
   .argument("[dir]", "target repo directory", ".")
   .option("--no-approve", "leave the mined rules as drafts for review")
-  .action(async (dir: string, opts: { approve?: boolean }) => {
+  .option("--no-watch", "return as soon as the push is sent, without following the build")
+  .action(async (dir: string, opts: { approve?: boolean; watch?: boolean }) => {
     const repo = resolve(dir);
     // Resolved before the link, because an unlinked repo now signs up for a
     // brain and Trail creates that brain FOR a named repository. Without a slug
@@ -1396,8 +1412,48 @@ brain
     }
     const brainLabel = expected?.brainName ? `“${expected.brainName}”` : link.brainId;
     console.error(`✓ sent ${d.owner}/${d.name} to ${brainLabel}`);
-    console.error("· it is being mined into rules now — a few minutes. Watch it finish in your browser.");
-    console.error("  The rules reach this repo on their own; nothing else to run.");
+
+    // Held rather than handed back. Everything above this line succeeded even
+    // in the runs that end badly: the push lands, and then the miner fails —
+    // which is where roughly a third of production's repo brains die. Returning
+    // the prompt here is what made that invisible from this side, on CI and
+    // over SSH permanently so. `--no-watch` is for a caller that genuinely
+    // wants fire-and-forget, and it prints the old two lines instead.
+    if (opts.watch === false) {
+      console.error("· it is being mined into rules now — a few minutes. Watch it finish in your browser.");
+      console.error("  The rules reach this repo on their own; nothing else to run.");
+      return;
+    }
+
+    console.error("· building the brain — Ctrl-C detaches, it keeps going without you");
+    const outcome = await watchBuild(link);
+    if (outcome === "completed") {
+      console.error("✓ the brain is built — its rules reach this repo on their own; nothing else to run");
+      return;
+    }
+    // The ordinary ending for anything but a small repository. The history is
+    // mined in slices, and the prompt comes back on the first of them: mining is
+    // the part that fails and it has now succeeded, and the rest is filing,
+    // which is minutes of reliable work nobody gains by watching. The rules
+    // already in the brain are already being served.
+    if (outcome === "building") {
+      console.error("✓ the brain has its first rules — they reach this repo on their own; nothing else to run");
+      console.error("  The rest of the history is still being read. Watch it fill in your browser.");
+      return;
+    }
+    if (outcome === "failed") {
+      // A non-zero exit, unlike every other ending here: this is the one case
+      // where the work did not produce a brain, and a CI step that ran the push
+      // should hear about it the way it hears about any other failure.
+      console.error("  Nothing was lost — the brain is still there. Run `graft brain push` again to retry the read.");
+      process.exitCode = 1;
+      return;
+    }
+    if (outcome === "unreachable") {
+      console.error("· could not reach Trail to follow the build — it is still running. Watch it finish in your browser.");
+      return;
+    }
+    console.error("· still building after 15 minutes — it has not failed, it is just long. Watch it finish in your browser.");
   });
 
 brain
